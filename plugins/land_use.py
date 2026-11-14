@@ -1,26 +1,31 @@
 import numpy as np
 from typing import Optional, Dict
 
-from murasa.core.base import ParameterPlugin
+from murasa.core.base import ParameterPlugin, register_plugin
 from murasa.core.data_source import DataRegistry
-from murasa.core.resampler import VectorResampler
 from murasa.core.processing import ProcessingContext
 from murasa.core.logger import logger
 
 
+@register_plugin("land_use")
 class LandUsePlugin(ParameterPlugin):
     """
-    Land use runoff coefficient
-
-    Different land covers have different runoff characteristics:
-    - Water/Impervious = 1.0 (100% runoff)
-    - Forest = 0.2 (80% infiltration)
+    Land use susceptibility parameter plugin.
     """
 
-    def __init__(self, name: str = "land_use", weight: float = 0.20,
-                 coefficients: Optional[Dict[str, float]] = None,
-                 priorities: Optional[Dict[str, int]] = None):
-        super().__init__(name, weight)
+    short_name = "landuse"
+    display_name = "Land Use"
+
+    def __init__(
+        self,
+        name: str = "land_use",
+        weight: float = 0.20,
+        group: str = "hazard",
+        coefficients: Optional[Dict[str, float]] = None,
+        priorities: Optional[Dict[str, int]] = None,
+        **kwargs
+    ):
+        super().__init__(name, weight, group, **kwargs)
         self.coefficients = coefficients or {
             'water': 1.0,
             'settlement': 0.85,
@@ -50,40 +55,44 @@ class LandUsePlugin(ParameterPlugin):
     def process(self, registry, grid_shape, transform, crs):
         self.log_processing()
 
-        landuse_raster = np.full(grid_shape, self.coefficients['default'],
-                                 dtype=np.float32)
+        landuse_raster = np.full(
+            grid_shape,
+            self.coefficients.get('default', 0.50),
+            dtype=np.float32
+        )
 
-        landuse_sources = [k for k in registry.list_sources()
-                           if k.startswith('landuse_')]
-
+        landuse_sources = [k for k in registry.list_sources() if k.startswith('landuse_')]
         if not landuse_sources:
             logger.warning("      No landuse data found, using default")
             return landuse_raster
 
-        priority_order = sorted(
-            landuse_sources,
-            key=lambda x: self.priorities.get(
-                x.replace('landuse_', ''), 0
-            )
-        )
+        def _get_priority(src_key: str) -> int:
+            lu = src_key.replace('landuse_', '')
+            if lu == 'paddy' and 'paddy' not in self.priorities and 'agriculture' in self.priorities:
+                return self.priorities['agriculture']
+            return self.priorities.get(lu, 0)
+
+        priority_order = sorted(landuse_sources, key=_get_priority)
 
         logger.info(f"      Rasterizing {len(priority_order)} landuse layers...")
-
         ctx = ProcessingContext(grid_shape, transform, crs)
 
         for name in priority_order:
             source = registry.get(name)
             lu_type = name.replace('landuse_', '')
-            coeff = self.coefficients.get(lu_type, 0.5)
+            if lu_type == 'paddy' and 'paddy' not in self.coefficients and 'agriculture' in self.coefficients:
+                coeff = self.coefficients['agriculture']
+            else:
+                coeff = self.coefficients.get(lu_type, self.coefficients.get('default', 0.5))
 
             if source.data.empty:
                 continue
 
             mask = ctx.rasterize_vector(source).astype(bool)
-
             landuse_raster[mask] = coeff
             logger.debug(f"         {lu_type}: {mask.sum()} pixels")
 
+        landuse_raster = registry.apply_study_area_mask(landuse_raster)
         self.result = landuse_raster
         self.log_result()
         return landuse_raster

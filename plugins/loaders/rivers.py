@@ -6,9 +6,9 @@ from murasa.core.logger import log_success, log_warning
 
 class RiversLoader(DataLoaderPlugin):
     """
-    Load river networks from RBI directories
-    Expected patterns: SUNGAI_LN, SUNGAI, RIVER
+    Loads river network line vectors from RBI when a direct river path is not already loaded.
     """
+
     provides = ["river"]
     requires = []
 
@@ -16,16 +16,18 @@ class RiversLoader(DataLoaderPlugin):
 
     def __init__(self, config):
         super().__init__("RiversLoader")
-        self.admin_dirs = [Path(d) for d in config.paths.admin_dirs]
+        self.admin_dirs = [Path(d) for d in (config.paths.get("admin_dirs") or [])]
         self.target_crs = config.spatial.target_crs
 
     @classmethod
     def can_handle(cls, config) -> bool:
-        return config.paths.admin_dirs is not None and len(config.paths.admin_dirs) > 0
+        return bool(config.paths.get("admin_dirs"))
 
     def load(self, registry):
-        self.log_loading("Loading river networks...")
+        if registry.has("river"):
+            return {"river": registry.get("river", auto_load=False)}
 
+        self.log_loading("Loading river networks...")
         gdf_rivers = scan_all(self.admin_dirs, self.RIVER_PATTERNS, self.target_crs)
 
         if gdf_rivers.empty:
@@ -34,6 +36,5 @@ class RiversLoader(DataLoaderPlugin):
 
         source = registry.register_vector("river", gdf_rivers, self.target_crs, feature_count=len(gdf_rivers))
         self.loaded_sources["river"] = source
-
         log_success(f"Loaded river networks: {len(gdf_rivers)} features")
         return self.loaded_sources

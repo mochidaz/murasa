@@ -1,5 +1,6 @@
 from pathlib import Path
 from typing import List, Optional
+import re
 
 import geopandas as gpd
 import pandas as pd
@@ -12,14 +13,6 @@ def scan_shapefiles(directories: List[Path],
                     target_crs: str = "EPSG:4326") -> gpd.GeoDataFrame:
     """
     Scan directories for shapefiles matching pattern names.
-
-    Args:
-        directories: List of directories to search
-        patterns: Filename patterns to match (case-insensitive substring match)
-        target_crs: Target CRS to reproject to
-
-    Returns:
-        Merged GeoDataFrame (empty if no files found)
     """
     frames = []
 
@@ -44,15 +37,7 @@ def scan_gdb_layers(directories: List[Path],
                     patterns: List[str],
                     target_crs: str = "EPSG:4326") -> gpd.GeoDataFrame:
     """
-    Scan directories for GeoDatabase layers matching pattern names.
-
-    Args:
-        directories: List of directories to search
-        patterns: Layer name patterns to match (case-insensitive substring match)
-        target_crs: Target CRS to reproject to
-
-    Returns:
-        Merged GeoDataFrame (empty if no layers found)
+    Scan directories for GDB layers matching pattern names.
     """
     try:
         import fiona
@@ -90,15 +75,7 @@ def scan_all(directories: List[Path],
              patterns: List[str],
              target_crs: str = "EPSG:4326") -> gpd.GeoDataFrame:
     """
-    Scan both shapefiles and GDB layers.
-
-    Args:
-        directories: List of directories to search
-        patterns: Filename/layer patterns to match
-        target_crs: Target CRS to reproject to
-
-    Returns:
-        Merged GeoDataFrame from all sources
+    Scan directories for both shapefiles and GDB layers matching pattern names.
     """
     gdf_shp = scan_shapefiles(directories, patterns, target_crs)
     gdf_gdb = scan_gdb_layers(directories, patterns, target_crs)
@@ -117,18 +94,7 @@ def scan_filename(directories: List[Path],
                   target_crs: str = "EPSG:4326",
                   validate_geometries: bool = True) -> gpd.GeoDataFrame:
     """
-    Scan directories for an exact filename match (e.g., ADMINISTRASIDESA_AR_25K.shp).
-
-    This replaces the existing `load_vector_from_multiple_dirs` function.
-
-    Args:
-        directories: List of directories to search
-        filename: Exact filename to match
-        target_crs: Target CRS to reproject to
-        validate_geometries: Whether to remove invalid geometries
-
-    Returns:
-        Merged GeoDataFrame
+    Scan directories for a specific shapefile or GDB layer by filename.
     """
     frames = []
 
@@ -156,7 +122,10 @@ def scan_filename(directories: List[Path],
 
 def _match_pattern(name: str, patterns: List[str]) -> bool:
     name_upper = name.upper()
-    return any(p.upper() in name_upper for p in patterns)
+    return any(
+        re.search(r"(?:^|_|NONAGRI|AGRI)" + re.escape(p.upper()), name_upper) is not None
+        for p in patterns
+    )
 
 
 def _merge_frames(frames: list, target_crs: str) -> gpd.GeoDataFrame:

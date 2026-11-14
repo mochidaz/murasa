@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
-from typing import Tuple, Any
 from pathlib import Path
+from typing import Tuple, Any, Optional, Dict, List, Type
+import inspect
 import numpy as np
 
 from .data_source import DataRegistry
@@ -9,73 +10,56 @@ from .logger import logger
 
 class ParameterPlugin(ABC):
     """
-    Abstract base class for risk parameters
-
-    Each parameter plugin:
-    1. Validates required data sources
-    2. Processes input data
-    3. Returns normalized risk raster (0-1)
-
-    Example plugins:
-    - ElevationPlugin: Low elevation = High flood risk
-    - SlopePlugin: Steep slope = High landslide risk
-    - ProximityPlugin: Close to river = High flood risk
+    Abstract base class for spatial risk parameter plugins.
+    Each plugin validates required data sources and processes spatial inputs into a normalized
+    0-1 risk raster.
     """
 
-    def __init__(self, name: str, weight: float = 1.0):
-        """
-        Initialize parameter plugin
+    short_name: Optional[str] = None
+    contrib_name: Optional[str] = None
+    display_name: Optional[str] = None
 
-        Args:
-            name: Unique identifier for this parameter
-            weight: Relative weight in risk calculation (0-1)
-        """
+    def __init__(self, name: str, weight: float = 1.0, group: str = "hazard", **kwargs):
         self.name = name
         self.weight = weight
-        self.result: np.ndarray = None
-        self.metadata: dict = {}
+        self.group = group
+        self.result: Optional[np.ndarray] = None
+        self.metadata: Dict[str, Any] = dict(kwargs)
         self.is_exclusion: bool = False
+
+    @property
+    def column_key(self) -> str:
+        """Short identifier used for parameter score columns."""
+        return self.short_name or self.name
+
+    @property
+    def contrib_key(self) -> str:
+        """Short identifier used for weighted contribution columns."""
+        return self.contrib_name or self.column_key
+
+    @property
+    def label(self) -> str:
+        """Reporting label."""
+        return self.display_name or self.name.replace("_", " ").title()
 
     @abstractmethod
     def validate_requirements(self, registry: DataRegistry) -> bool:
-        """
-        Check if required data sources are available
-
-        Args:
-            registry: Data registry to check
-
-        Returns:
-            True if all requirements met
-        """
+        """Check whether required data sources exist in the registry."""
         pass
 
     @abstractmethod
-    def process(self,
-                registry: DataRegistry,
-                grid_shape: Tuple[int, int],
-                transform: Any,
-                crs: str) -> np.ndarray:
-        """
-        Process data and return normalized risk raster
-
-        Args:
-            registry: Data source registry
-            grid_shape: Target raster shape (height, width)
-            transform: Rasterio transform object
-            crs: Target coordinate reference system
-
-        Returns:
-            Normalized risk array (0-1, float32)
-        """
+    def process(
+        self,
+        registry: DataRegistry,
+        grid_shape: Tuple[int, int],
+        transform: Any,
+        crs: str
+    ) -> np.ndarray:
+        """Compute and return the normalized risk raster (0-1, float32)."""
         pass
 
     def get_statistics(self) -> dict:
-        """
-        Calculate statistics of the result
-
-        Returns:
-            Dictionary with min, max, mean, std
-        """
+        """Compute descriptive statistics for the processed parameter raster."""
         if self.result is None:
             return {}
 
@@ -92,54 +76,40 @@ class ParameterPlugin(ABC):
             'total_pixels': self.result.size
         }
 
-    def normalize_percentile(self,
-                             data: np.ndarray,
-                             lower: float = 5,
-                             upper: float = 95) -> np.ndarray:
-        """
-        Normalize using percentile-based scaling (robust to outliers)
-
-        Args:
-            data: Input array
-            lower: Lower percentile
-            upper: Upper percentile
-
-        Returns:
-            Normalized array (0-1)
-        """
+    def normalize_percentile(
+        self,
+        data: np.ndarray,
+        lower: float = 5,
+        upper: float = 95
+    ) -> np.ndarray:
+        """Normalize array to 0-1 using percentile clipping."""
         valid = np.isfinite(data)
         if not valid.any():
             logger.warning(f"{self.name}: No valid data for normalization")
             return np.zeros_like(data)
 
         d_min, d_max = np.percentile(data[valid], [lower, upper])
-
         if d_max == d_min:
             logger.warning(f"{self.name}: Constant values detected")
-            return np.full_like(data, 0.5)
+            result = np.full_like(data, np.nan, dtype=np.float32)
+            result[valid] = 0.5
+            return result
 
         normalized = np.clip((data - d_min) / (d_max - d_min), 0, 1)
         return normalized.astype(np.float32)
 
     def normalize_minmax(self, data: np.ndarray) -> np.ndarray:
-        """
-        Standard min-max normalization
-
-        Args:
-            data: Input array
-
-        Returns:
-            Normalized array (0-1)
-        """
+        """Normalize array to 0-1 using min-max scaling."""
         valid = np.isfinite(data)
         if not valid.any():
             return np.zeros_like(data)
 
         d_min = np.nanmin(data)
         d_max = np.nanmax(data)
-
         if d_max == d_min:
-            return np.full_like(data, 0.5)
+            result = np.full_like(data, np.nan, dtype=np.float32)
+            result[valid] = 0.5
+            return result
 
         normalized = (data - d_min) / (d_max - d_min)
         return normalized.astype(np.float32)
@@ -149,70 +119,52 @@ class ParameterPlugin(ABC):
 
     def log_result(self):
         stats = self.get_statistics()
-        if stats:
+        if stats and stats.get('valid_pixels', 0) > 0:
             logger.info(f"      Range: {stats['min']:.3f} - {stats['max']:.3f}")
         else:
-            logger.warning(f"      No valid data produced")
+            logger.warning("      No valid data produced")
 
     def __repr__(self) -> str:
-        return f"{self.__class__.__name__}(name='{self.name}', weight={self.weight:.3f})"
+        return f"{self.__class__.__name__}(name='{self.name}', weight={self.weight:.3f}, group='{self.group}')"
 
     def __str__(self) -> str:
-        return f"{self.name} ({self.weight:.3f})"
+        return f"{self.name} [{self.group}] ({self.weight:.3f})"
 
 
 class RasterParameterPlugin(ParameterPlugin):
     """
-    Mainly for normalization.
-
-    Subclasses only need to declare:
-        source_keys: Registry keys to try (first found is used)
-        inverse: Whether to invert the result (1 - normalized)
-        normalization: "percentile", "minmax", "rank", or "zscore"
-
-    And optionally override:
-        transform_data(data, ctx): Custom transformation before normalization
-
-    Example:
-        class ElevationPlugin(RasterParameterPlugin):
-            source_keys = ['dem', 'elevation']
-            inverse = True
+    Base class for raster-based risk parameters with declarative source lookup and normalization.
     """
 
-    source_keys: list[str] = []
+    source_keys: List[str] = []
     inverse: bool = False
     normalization: str = "percentile"
 
-    def __init__(self, name: str = "", weight: float = 1.0, **kwargs):
+    def __init__(self, name: str = "", weight: float = 1.0, group: str = "hazard", **kwargs):
         if not name:
             name = self.__class__.__name__.replace("Plugin", "").lower()
-        super().__init__(name, weight)
+        if "invert" in kwargs and "inverse" not in kwargs:
+            kwargs["inverse"] = kwargs.pop("invert")
+        super().__init__(name, weight, group, **kwargs)
         for key, val in kwargs.items():
             setattr(self, key, val)
 
     def validate_requirements(self, registry: DataRegistry) -> bool:
-        return any(registry.has(k) for k in self.source_keys)
+        keys = self.source_keys or [self.name]
+        return any(registry.has(k) for k in keys)
 
     def _find_source(self, registry: DataRegistry):
-        for key in self.source_keys:
+        keys = self.source_keys or [self.name]
+        for key in keys:
             if registry.has(key):
                 return registry.get(key)
         raise KeyError(
-            f"{self.name}: None of {self.source_keys} found in registry. "
+            f"{self.name}: None of {keys} found in registry. "
             f"Available: {registry.list_sources()}"
         )
 
     def transform_data(self, data: np.ndarray, ctx) -> np.ndarray:
-        """
-        Override to apply custom transformations before normalization.
-
-        Args:
-            data: Resampled raster array
-            ctx: ProcessingContext instance
-
-        Returns:
-            Transformed array
-        """
+        """Apply custom transformations before normalization."""
         return data
 
     def _normalize(self, data: np.ndarray) -> np.ndarray:
@@ -239,6 +191,7 @@ class RasterParameterPlugin(ParameterPlugin):
         source = self._find_source(registry)
         data = ctx.resample_raster(source)
         data = self.transform_data(data, ctx)
+        data = registry.apply_study_area_mask(data)
         normalized = self._normalize(data)
 
         if self.inverse:
@@ -249,92 +202,64 @@ class RasterParameterPlugin(ParameterPlugin):
         return self.result
 
 
-class PluginRegistry:
-    def __init__(self):
-        self.plugins: dict[str, type[ParameterPlugin]] = {}
-
-    def register(self, plugin_class: type[ParameterPlugin]) -> None:
-        name = plugin_class.__name__
-        self.plugins[name] = plugin_class
-        logger.debug(f"Registered plugin: {name}")
-
-    def get(self, name: str) -> type[ParameterPlugin]:
-        if name not in self.plugins:
-            raise KeyError(f"Plugin '{name}' not found. "
-                           f"Available: {list(self.plugins.keys())}")
-        return self.plugins[name]
-
-    def list_plugins(self) -> list[str]:
-        """List all registered plugins"""
-        return list(self.plugins.keys())
-
-
-plugin_registry = PluginRegistry()
-
-
-class PostProcessorPlugin(ABC):
+class RiskCalculatorPlugin(ABC):
     """
-    For post-processing results after rasterization and risk calculation.
-    For example, vectorization, adding explainability, etc.
+    Abstract base class for risk calculation formulas.
+
+    Like WLC, BNPB's Formula, and others.
     """
 
     def __init__(self, name: str):
         self.name = name
 
     @abstractmethod
-    def post_process(self,
-                     registry: DataRegistry,
-                     risk_raster: np.ndarray,
-                     transform: Any,
-                     crs: str,
-                     output_dir: Any,
-                     config: Any = None):
-        """
-        Execute post-processing logic
-        
-        Args:
-            registry: Data registry (to access input factors)
-            risk_raster: The final calculated risk raster
-            transform: Rasterio transform
-            crs: CRS string
-            output_dir: Path to output directory
-            config: EngineConfig object (optional)
-        """
+    def calculate(
+        self,
+        parameters: List[ParameterPlugin],
+        results: Dict[str, np.ndarray],
+        grid_shape: Tuple[int, int]
+    ) -> np.ndarray:
+        """Combine parameter rasters into the final composite risk raster."""
+        pass
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(name='{self.name}')"
+
+
+class PostProcessorPlugin(ABC):
+    """
+    Abstract base class for post-processing pipelines executed after risk raster calculation.
+    """
+
+    def __init__(self, name: str):
+        self.name = name
+
+    @abstractmethod
+    def post_process(
+        self,
+        registry: DataRegistry,
+        risk_raster: np.ndarray,
+        transform: Any,
+        crs: str,
+        output_dir: Any,
+        config: Any = None
+    ):
+        """Execute post-processing and export derived artifacts."""
         pass
 
 
 class CircularDependencyError(Exception):
+    """Raised when data loaders declare a cyclic dependency graph."""
     pass
 
 
 class DataLoaderPlugin(ABC):
     """
-    Data loader plugin base class.
-    
-    Data loaders are used for:
-    1. Loading data from various sources (files, APIs, etc.)
-    2. Preprocessing and validation
-    3. Registering data sources to DataRegistry
-    
-    Dependencies are declared via:
-    - provides: List of registry keys this loader registers
-    - requires: List of registry keys this loader needs
-    
-    LoaderRegistry uses topological sort to resolve execution order
-    automatically based on these declarations.
-    
-    Example:
-        class RiversLoader(DataLoaderPlugin):
-            provides = ["river"]
-            requires = []
-        
-        class ProximityLoader(DataLoaderPlugin):
-            provides = ["river_proximity"]
-            requires = ["river"]
+    Abstract base class for data loader plugins with dependency resolution via provides/requires.
     """
 
-    provides: list[str] = []
-    requires: list[str] = []
+    provides: List[str] = []
+    requires: List[str] = []
 
     def __init__(self, name: str):
         self.name = name
@@ -343,23 +268,15 @@ class DataLoaderPlugin(ABC):
     @classmethod
     @abstractmethod
     def can_handle(cls, config) -> bool:
-        """
-        Check if this loader should run based on config
-
-        Args:
-            config: EngineConfig object
-
-        Returns:
-            True if this loader should be executed
-        """
+        """Determine whether this loader should run given the active configuration."""
         pass
 
     @abstractmethod
     def load(self, registry: DataRegistry) -> dict:
+        """Load data sources and register them into the DataRegistry."""
         pass
 
     def log_loading(self, message: str):
-        """Log loading progress"""
         logger.info(f"[{self.name}] {message}")
 
     def __repr__(self) -> str:
@@ -367,92 +284,179 @@ class DataLoaderPlugin(ABC):
         return f"{self.__class__.__name__}(provides={self.provides}{deps})"
 
 
-class LoaderRegistry:
+class PluginRegistry:
     """
-    Registry for managing data loader plugins with auto-discovery
-    
-    Features:
-    - Auto-discover loader plugins from directory
-    - Topological sort based on provides/requires declarations
-    - Circular dependency detection
-    - Skip loaders based on config conditions
+    Unified registry for parameter, calculator, and post-processor plugins with signature-safe instantiation.
     """
 
     def __init__(self):
-        self.loaders: list[type[DataLoaderPlugin]] = []
+        self.plugins: Dict[str, Type] = {}
+        self._discovered_dirs: set[Path] = set()
+
+    def register(self, name: str, plugin_class: Type = None):
+        """Register a plugin class by canonical name or as a class decorator."""
+        if plugin_class is None:
+            def decorator(cls):
+                self.plugins[name] = cls
+                logger.debug(f"Registered plugin: {name} ({cls.__name__})")
+                return cls
+            return decorator
+
+        self.plugins[name] = plugin_class
+        logger.debug(f"Registered plugin: {name} ({plugin_class.__name__})")
+        return plugin_class
+
+    def has(self, name: str) -> bool:
+        return name in self.plugins
+
+    def get(self, name: str) -> Type:
+        if name not in self.plugins:
+            raise KeyError(
+                f"Plugin '{name}' not found in registry. "
+                f"Available: {list(self.plugins.keys())}"
+            )
+        return self.plugins[name]
+
+    def create(
+        self,
+        name: str,
+        weight: float = 1.0,
+        group: str = "hazard",
+        parameters: Optional[dict] = None
+    ) -> Any:
+        """Instantiate a registered plugin, matching constructor arguments safely via inspection."""
+        cls = self.get(name)
+        raw_params = dict(parameters or {})
+
+        sig = inspect.signature(cls.__init__)
+        accepts_kwargs = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD
+            for p in sig.parameters.values()
+        )
+
+        call_kwargs = {}
+        extra_metadata = {}
+
+        if issubclass(cls, ParameterPlugin):
+            if "weight" in sig.parameters or accepts_kwargs:
+                call_kwargs["weight"] = weight
+            if "group" in sig.parameters or accepts_kwargs:
+                call_kwargs["group"] = group
+
+        for k, v in raw_params.items():
+            if k in ("weight", "group") and k in call_kwargs:
+                continue
+            if k in sig.parameters or accepts_kwargs:
+                call_kwargs[k] = v
+            else:
+                extra_metadata[k] = v
+
+        instance = cls(**call_kwargs)
+        if hasattr(instance, "metadata") and isinstance(instance.metadata, dict):
+            instance.metadata.update(extra_metadata)
+        return instance
+
+    def auto_discover(self, plugins_dir: Optional[Path] = None):
+        """Auto-discover and import all plugin modules in the specified directory."""
+        import importlib.util
+
+        if plugins_dir is None:
+            plugins_dir = Path(__file__).parent.parent / "plugins"
+        plugins_dir = Path(plugins_dir).resolve()
+
+        if plugins_dir in self._discovered_dirs or not plugins_dir.exists():
+            return
+
+        logger.debug(f"Auto-discovering plugins in: {plugins_dir}")
+        for py_file in sorted(plugins_dir.glob("*.py")):
+            if py_file.name.startswith("_"):
+                continue
+            try:
+                spec = importlib.util.spec_from_file_location(f"murasa.plugins.{py_file.stem}", py_file)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+            except Exception as e:
+                logger.debug(f"Auto-discovery notice for {py_file.name}: {e}")
+
+        self._discovered_dirs.add(plugins_dir)
+
+    def list_plugins(self, base_type: Optional[Type] = None) -> List[str]:
+        """List registered plugin names, optionally filtered by base class."""
+        if base_type is None:
+            return list(self.plugins.keys())
+        return [
+            name for name, cls in self.plugins.items()
+            if isinstance(cls, type) and issubclass(cls, base_type)
+        ]
+
+
+plugin_registry = PluginRegistry()
+
+
+def register_plugin(name: str):
+    """Decorator to register a ParameterPlugin, RiskCalculatorPlugin, or PostProcessorPlugin."""
+    return plugin_registry.register(name)
+
+
+class LoaderRegistry:
+    """
+    Registry for DataLoaderPlugin classes with automatic discovery and topological dependency sorting.
+    """
+
+    def __init__(self):
+        self.loaders: List[Type[DataLoaderPlugin]] = []
         self._discovered = False
 
-    def auto_discover(self, plugins_dir: Path):
-        """
-        Discover and register loader plugins from directory
-        
-        Args:
-            plugins_dir: Root plugins directory to search
-        """
+    def auto_discover(self, plugins_dir: Optional[Path] = None):
+        """Discover all DataLoaderPlugin subclasses in the plugins/loaders directory."""
         import importlib.util
-        import inspect
 
-        loaders_dir = plugins_dir / "loaders"
+        if plugins_dir is None:
+            plugins_dir = Path(__file__).parent.parent / "plugins"
+        loaders_dir = Path(plugins_dir) / "loaders"
 
         if not loaders_dir.exists():
             logger.warning(f"Loaders directory not found: {loaders_dir}")
             return
 
-        logger.info(f"Auto-discovering data loaders in: {loaders_dir}")
-
-        for module_file in loaders_dir.glob("*.py"):
+        for module_file in sorted(loaders_dir.glob("*.py")):
             if module_file.name.startswith("_"):
                 continue
 
             try:
                 spec = importlib.util.spec_from_file_location(
-                    f"plugins.loaders.{module_file.stem}", module_file
+                    f"murasa.plugins.loaders.{module_file.stem}", module_file
                 )
                 module = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(module)
 
-                for name, obj in inspect.getmembers(module, inspect.isclass):
-                    if (issubclass(obj, DataLoaderPlugin) and
-                            obj is not DataLoaderPlugin and
-                            obj not in self.loaders):
+                for _, obj in inspect.getmembers(module, inspect.isclass):
+                    if (
+                        issubclass(obj, DataLoaderPlugin)
+                        and obj is not DataLoaderPlugin
+                        and obj not in self.loaders
+                    ):
                         self.loaders.append(obj)
-                        logger.debug(
-                            f"  Discovered: {obj.__name__} "
-                            f"(provides={obj.provides}, requires={obj.requires})"
-                        )
-
             except Exception as e:
                 logger.error(f"Failed to load loader module {module_file.name}: {e}")
 
         self._discovered = True
-        logger.info(f"Discovered {len(self.loaders)} data loader(s)")
 
-    def register(self, loader_class: type[DataLoaderPlugin]):
+    def register(self, loader_class: Type[DataLoaderPlugin]):
         if loader_class not in self.loaders:
             self.loaders.append(loader_class)
 
-    def _resolve_order(self, active_loaders: list[type[DataLoaderPlugin]]) -> list[type[DataLoaderPlugin]]:
-        """
-        Resolve execution order using topological sort (Kahn's algorithm)
-        
-        Args:
-            active_loaders: List of loader classes to sort
-            
-        Returns:
-            Loaders in dependency-safe execution order
-            
-        Raises:
-            CircularDependencyError: If circular dependencies are detected
-        """
+    def _resolve_order(self, active_loaders: List[Type[DataLoaderPlugin]]) -> List[Type[DataLoaderPlugin]]:
+        """Resolve loader execution order using Kahn's topological sort algorithm."""
         from collections import defaultdict, deque
 
-        provider_map: dict[str, type[DataLoaderPlugin]] = {}
+        provider_map: Dict[str, Type[DataLoaderPlugin]] = {}
         for loader in active_loaders:
             for key in loader.provides:
                 provider_map[key] = loader
 
-        graph: dict[type, set[type]] = defaultdict(set)
-        in_degree: dict[type, int] = {loader: 0 for loader in active_loaders}
+        graph: Dict[Type, set[Type]] = defaultdict(set)
+        in_degree: Dict[Type, int] = {loader: 0 for loader in active_loaders}
 
         for loader in active_loaders:
             for req in loader.requires:
@@ -462,10 +466,7 @@ class LoaderRegistry:
                         graph[dependency].add(loader)
                         in_degree[loader] += 1
                 else:
-                    logger.warning(
-                        f"{loader.__name__} requires '{req}' "
-                        f"but no loader provides it"
-                    )
+                    logger.warning(f"{loader.__name__} requires '{req}' but no loader provides it")
 
         queue = deque(
             sorted(
@@ -486,31 +487,20 @@ class LoaderRegistry:
 
         if len(ordered) != len(active_loaders):
             unresolved = [l.__name__ for l in active_loaders if l not in ordered]
-            raise CircularDependencyError(
-                f"Circular dependency detected among: {unresolved}"
-            )
+            raise CircularDependencyError(f"Circular dependency detected among: {unresolved}")
 
         return ordered
 
     def load_all(self, config, registry: DataRegistry):
-        """
-        Execute all applicable loaders in dependency-resolved order
-        
-        Args:
-            config: EngineConfig object
-            registry: DataRegistry to register sources to
-        """
+        """Execute all applicable data loaders in dependency-resolved order."""
         if not self._discovered:
-            logger.warning("Loaders not discovered yet. Call auto_discover() first.")
-            return
+            self.auto_discover()
 
         active = [l for l in self.loaders if l.can_handle(config)]
-        skipped = [l for l in self.loaders if not l.can_handle(config)]
-
-        for loader_class in skipped:
-            logger.debug(f"Skipping {loader_class.__name__} (conditions not met)")
-
         ordered = self._resolve_order(active)
+
+        if not ordered:
+            return
 
         logger.info("\n" + "=" * 70)
         logger.info("DATA LOADING PHASE")
@@ -521,24 +511,19 @@ class LoaderRegistry:
         for loader_class in ordered:
             provides_str = ', '.join(loader_class.provides) or 'none'
             requires_str = ', '.join(loader_class.requires) or 'none'
-            logger.info(
-                f"\n{loader_class.__name__} "
-                f"(provides=[{provides_str}], requires=[{requires_str}])"
-            )
+            logger.info(f"\n{loader_class.__name__} (provides=[{provides_str}], requires=[{requires_str}])")
             try:
                 loader = loader_class(config)
                 loader.load(registry)
                 executed += 1
             except Exception as e:
                 logger.error(f"Loader {loader_class.__name__} failed: {e}")
-                import traceback
-                traceback.print_exc()
 
         logger.info("\n" + "=" * 70)
         logger.info(f"DATA LOADING COMPLETE ({executed}/{len(ordered)} loader(s) executed)")
         logger.info("=" * 70 + "\n")
 
-    def list_loaders(self) -> list[str]:
+    def list_loaders(self) -> List[str]:
         return [loader.__name__ for loader in self.loaders]
 
     def __len__(self) -> int:

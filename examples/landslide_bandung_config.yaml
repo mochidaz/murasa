@@ -1,0 +1,87 @@
+project:
+  name: "Bandung Raya Landslide Susceptibility Analysis"
+  description: "Analisis kerentanan tanah longsor"
+
+spatial:
+  target_crs: "EPSG:32748"
+  resolution: 10
+  filter_city: [ "KOTA BANDUNG", "KOTA CIMAHI", "KAB. BANDUNG", "KAB. BANDUNG BARAT" ]
+  study_area_key: "admin"
+  reference_raster: "filled_dem_tif.tif"
+
+paths:
+  dem: "../../data/DEMNAS/merged/new2026/filled_dem_tif.tif"
+  slope: "../../data/DEMNAS/merged/new2026/filled_slope_tif.tif"
+  rainfall: "../../data/chirps/v2p0chirps202512/v2p0chirps202512.bil"
+  admin_dirs:
+    - "../../data/wilayah-administrasi/KAB. BANDUNG"
+    - "../../data/wilayah-administrasi/KAB. BANDUNG BARAT"
+    - "../../data/wilayah-administrasi/KOTA BANDUNG"
+    - "../../data/wilayah-administrasi/KOTA CIMAHI"
+    #- "../../data/wilayah-administrasi/tribakti"
+  output_dir: "../output_landslide/newest-after-refactor"
+  soil: "../../data/soil/soil.shp"
+
+weights:
+  rainfall: 0.30
+  slope: 0.20
+  land_use: 0.20
+  soil: 0.15
+  elevation: 0.15
+
+
+parameters:
+  soil:
+    column_name: "HWSD2_SM_7"
+    score_mapping:
+      AC: 0.90 # Acrisols
+      AN: 0.85 # Andosols
+      CM: 0.75 # Cambisols
+      LP: 0.80 # Leptosols
+      NT: 0.60 # Nitisols
+      LX: 0.50 # Lixisols
+      FL: 0.20 # Fluvisols
+      VR: 0.30 # Vertisols
+      default: 0.50
+  slope:
+    inverse: false
+  elevation:
+    inverse: false  
+  rainfall:
+    column_name: "gridcode"
+    year: 2025
+    month: 12
+    value_mapping:
+      1: 10
+      2: 35
+      3: 75
+      4: 125
+      5: 175
+      6: 250
+      7: 350
+      8: 450
+      9: 600
+
+  land_use:
+    coefficients:
+      bare_soil: 0.95
+      paddy: 0.70
+      agriculture: 0.70
+      road: 0.65
+      settlement: 0.60
+      plantation: 0.40
+      shrub: 0.35
+      forest: 0.20
+      water: 0.10
+      default: 0.50
+    priorities:
+      water: 100
+      bare_soil: 90
+      road: 85
+      paddy: 80
+      agriculture: 80
+      settlement: 70
+      plantation: 40
+      shrub: 30
+      forest: 20
+      default: 0

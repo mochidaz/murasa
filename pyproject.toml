@@ -27,9 +27,6 @@ dev = [
     "pytest-cov",
 ]
 
-[project.scripts]
-murasa = "murasa.run_flood_analysis:main"
-
 [tool.setuptools]
 packages = [
     "murasa",
@@ -37,7 +34,6 @@ packages = [
     "murasa.engine",
     "murasa.plugins",
     "murasa.plugins.loaders",
-    "murasa.presets",
 ]
 
 [tool.setuptools.package-dir]
@@ -46,8 +42,4 @@ murasa = "."
 "murasa.engine" = "engine"
 "murasa.plugins" = "plugins"
 "murasa.plugins.loaders" = "plugins/loaders"
-"murasa.presets" = "presets"
-
-[tool.setuptools.package-data]
-murasa = ["config/*.yaml"]
 

@@ -1,23 +1,40 @@
 from pathlib import Path
 from typing import Optional, List, Tuple, Any
+import json
 import numpy as np
 import geopandas as gpd
 import rasterio
 from rasterio.transform import from_bounds
 from rasterio.features import geometry_mask
 
-from murasa.core.config import EngineConfig
+from murasa.core.config import EngineConfig, infer_source_type
 from murasa.core.data_source import DataRegistry, DataSource, SourceType
 from murasa.core.logger import logger, log_section, log_subsection, log_success
-from murasa.core.base import ParameterPlugin, PostProcessorPlugin
+from murasa.core.base import (
+    ParameterPlugin,
+    PostProcessorPlugin,
+    RiskCalculatorPlugin,
+    LoaderRegistry,
+    plugin_registry,
+)
 
 
 class RiskEngine:
+    """
+    The Engine.
+
+    Manages the lifecycle of data sources, parameter plugins, risk calculation formulas,
+    and post-processors.
+
+    Based on the EngineConfig.
+    """
+
     def __init__(self, config: Optional[EngineConfig] = None):
         self.config = config or EngineConfig()
         self.registry = DataRegistry()
         self.parameters: List[ParameterPlugin] = []
         self.post_processors: List[PostProcessorPlugin] = []
+        self.calculator: Optional[RiskCalculatorPlugin] = None
 
         self.grid_shape: Optional[Tuple[int, int]] = None
         self.transform: Optional[Any] = None
@@ -29,11 +46,19 @@ class RiskEngine:
         self.risk_raster: Optional[np.ndarray] = None
         self.exclusion_mask: Optional[np.ndarray] = None
 
+    def register_calculator(self, plugin: RiskCalculatorPlugin) -> None:
+        self.calculator = plugin
+        log_success(f"Registered Risk Calculator: {plugin.name}")
+
     def register_data(self, name: str, source: DataSource) -> None:
         self.registry.register(name, source)
 
-    def register_data_from_path(self, name: str, path: Path,
-                                source_type: SourceType) -> None:
+    def register_data_from_path(
+        self,
+        name: str,
+        path: Path,
+        source_type: SourceType
+    ) -> None:
         source = DataSource(
             name=name,
             source_type=source_type,
@@ -43,20 +68,112 @@ class RiskEngine:
         self.registry.register(name, source)
 
     def auto_register_from_config(self) -> None:
-        log_subsection("Auto-registering data sources from factors")
+        """Register all file-based data sources defined in config.paths and config.factors."""
+        log_subsection("Auto-registering data sources from config")
+
+        if hasattr(self.config, "paths") and self.config.paths:
+            for name, path_val in self.config.paths.items():
+                if name == "output_dir" or not isinstance(path_val, Path):
+                    continue
+                if path_val.exists() and path_val.is_file() and not self.registry.has(name):
+                    stype_str = infer_source_type(path_val, default="raster")
+                    source_type = SourceType.RASTER if stype_str == "raster" else SourceType.VECTOR
+                    self.register_data_from_path(name, path_val, source_type)
+                    logger.info(f"  {name} ({source_type.value}): {path_val}")
 
         for name, factor in self.config.factors.items():
+            if self.registry.has(name):
+                continue
             if factor.source_path and factor.source_path.exists():
-                source_type = (SourceType.RASTER if factor.source_type == 'raster'
-                               else SourceType.VECTOR)
+                stype_str = infer_source_type(factor.source_path, default=factor.source_type)
+                source_type = SourceType.RASTER if stype_str == "raster" else SourceType.VECTOR
                 self.register_data_from_path(name, factor.source_path, source_type)
-                logger.info(f"  {name}: {factor.source_path}")
-            elif factor.source_type == 'derived':
+                logger.info(f"  {name} ({source_type.value}): {factor.source_path}")
+            elif factor.source_type == "derived":
                 logger.info(f"  {name}: derived (will be computed)")
             else:
                 logger.warning(f"  {name}: path not found or not specified")
 
         log_success(f"Registered {len(self.registry)} data sources")
+
+    def auto_register_parameters_from_config(self) -> int:
+        """Instantiate and register parameter plugins configured in weights or factors."""
+        log_subsection("Auto-registering risk parameter plugins")
+
+        plugins_dir = Path(__file__).parent.parent / "plugins"
+        plugin_registry.auto_discover(plugins_dir)
+
+        registered = 0
+        params_cfg = getattr(
+            self.config,
+            "plugin_parameters",
+            getattr(self.config, "parameters", {})
+        ) or {}
+
+        if hasattr(self.config, "weights") and self.config.weights:
+            for factor_name, weight in self.config.weights.items():
+                if weight is None or weight <= 0 or not plugin_registry.has(factor_name):
+                    continue
+                factor_params = params_cfg.get(factor_name, {})
+                group = factor_params.get("group", "hazard") if isinstance(factor_params, dict) else "hazard"
+                plugin = plugin_registry.create(
+                    factor_name,
+                    weight=weight,
+                    group=group,
+                    parameters=factor_params if isinstance(factor_params, dict) else {}
+                )
+                if self.register_parameter(plugin):
+                    registered += 1
+
+        elif hasattr(self.config, "factors") and self.config.factors:
+            for factor_name, factor_cfg in self.config.factors.items():
+                if not plugin_registry.has(factor_name):
+                    continue
+                params = getattr(factor_cfg, "parameters", {}) or {}
+                plugin = plugin_registry.create(
+                    factor_name,
+                    weight=factor_cfg.weight,
+                    group=factor_cfg.group,
+                    parameters=params
+                )
+                if self.register_parameter(plugin):
+                    registered += 1
+
+        for param_key, param_val in params_cfg.items():
+            if param_key in self.config.weights or not plugin_registry.has(param_key):
+                continue
+            cand = plugin_registry.create(
+                param_key,
+                weight=0.0,
+                parameters=param_val if isinstance(param_val, dict) else {}
+            )
+            if getattr(cand, "is_exclusion", False) and not any(p.name == cand.name for p in self.parameters):
+                self.register_parameter(cand)
+
+        logger.info(f"Auto-registered {registered} parameter plugin(s) from config")
+        return registered
+
+    def auto_register_post_processors_from_config(self) -> int:
+        """Instantiate and register post-processor plugins declared in config.post_processors."""
+        if not getattr(self.config, "post_processors", None):
+            return 0
+
+        plugins_dir = Path(__file__).parent.parent / "plugins"
+        plugin_registry.auto_discover(plugins_dir)
+
+        registered = 0
+        for item in self.config.post_processors:
+            if isinstance(item, str) and plugin_registry.has(item):
+                self.register_post_processor(plugin_registry.create(item))
+                registered += 1
+            elif isinstance(item, dict):
+                for name, params in item.items():
+                    if plugin_registry.has(name):
+                        self.register_post_processor(
+                            plugin_registry.create(name, parameters=params or {})
+                        )
+                        registered += 1
+        return registered
 
     def register_parameter(self, plugin: ParameterPlugin) -> bool:
         if not plugin.validate_requirements(self.registry):
@@ -76,25 +193,59 @@ class RiskEngine:
         logger.info("Cleared all parameters")
 
     def normalize_weights(self) -> None:
-        total = sum(p.weight for p in self.parameters)
+        active = [p for p in self.parameters if not p.is_exclusion]
+        total = sum(p.weight for p in active)
 
-        if abs(total - 1.0) < 0.001:
+        if total <= 0 or abs(total - 1.0) < 0.001:
             return
 
         logger.warning(f"Weights sum to {total:.3f}, normalizing...")
-        for param in self.parameters:
+        for param in active:
             param.weight /= total
 
-    def setup_grid(self, bounds: Optional[Tuple] = None,
-                   from_admin: bool = True) -> None:
+    def setup_grid(self, bounds: Optional[Tuple] = None, from_admin: bool = False) -> None:
+        """Initialize the spatial grid transform and dimensions from reference raster or study area bounds."""
+        ref_setting = getattr(self.config.spatial, "reference_raster", None)
+        target_path: Optional[Path] = None
+
+        if ref_setting:
+            if self.registry.has(ref_setting):
+                ref_source = self.registry.get(ref_setting, auto_load=False)
+                if ref_source.path:
+                    target_path = Path(ref_source.path)
+
+            if not target_path:
+                p = Path(ref_setting)
+                if p.exists():
+                    target_path = p
+                else:
+                    for source in self.registry.sources.values():
+                        if source.path and Path(source.path).name == ref_setting:
+                            target_path = Path(source.path)
+                            break
+        else:
+            for candidate_key in self.registry.list_by_type(SourceType.RASTER):
+                src = self.registry.get(candidate_key, auto_load=False)
+                if src.path and Path(src.path).exists():
+                    target_path = Path(src.path)
+                    break
+
+        if target_path and target_path.exists():
+            with rasterio.open(target_path) as src:
+                self.transform = src.transform
+                self.grid_shape = (src.height, src.width)
+                logger.info(f"Grid shape and transform aligned with reference raster: '{target_path.name}'")
+                log_success(f"Grid: {self.grid_shape[1]} x {self.grid_shape[0]} pixels")
+                return
+
         study_area_key = self.config.spatial.study_area_key
-        if from_admin and self.registry.has(study_area_key):
+        if bounds is None and self.registry.has(study_area_key):
             admin_source = self.registry.get(study_area_key)
             bounds = admin_source.data.total_bounds
-            logger.info(f"Grid bounds from {study_area_key} data")
+            logger.info(f"Grid bounds generated from vector {study_area_key} data")
 
         if bounds is None:
-            raise ValueError(f"Grid bounds required (provide bounds or {study_area_key} data)")
+            raise ValueError("Grid bounds required (provide bounds or reference_raster)")
 
         resolution = self.config.spatial.resolution
         width = int((bounds[2] - bounds[0]) / resolution)
@@ -102,10 +253,10 @@ class RiskEngine:
 
         self.transform = from_bounds(*bounds, width, height)
         self.grid_shape = (height, width)
-
-        log_success(f"Grid: {width}×{height} pixels @ {resolution}m")
+        log_success(f"Grid: {width} x {height} pixels @ {resolution}m")
 
     def set_study_area(self, admin_gdf: Optional[gpd.GeoDataFrame] = None) -> None:
+        """Rasterize the study area boundary polygon into a boolean mask."""
         study_area_key = self.config.spatial.study_area_key
         if admin_gdf is None:
             if not self.registry.has(study_area_key):
@@ -114,17 +265,17 @@ class RiskEngine:
             admin_gdf = self.registry.get(study_area_key).data
 
         self.admin_units = admin_gdf
-
         self.study_area_mask = geometry_mask(
             admin_gdf.geometry,
             transform=self.transform,
             invert=True,
             out_shape=self.grid_shape
         )
-
+        self.registry.study_area_mask = self.study_area_mask
         log_success(f"Study area: {len(admin_gdf)} units from key '{study_area_key}'")
 
     def calculate_risk(self) -> np.ndarray:
+        """Execute all registered parameter plugins and combine them via the active RiskCalculatorPlugin."""
         log_section("CALCULATING RISK")
 
         if not self.parameters:
@@ -133,45 +284,34 @@ class RiskEngine:
         if self.grid_shape is None or self.transform is None:
             raise ValueError("Grid not setup (call setup_grid first)")
 
+        if self.calculator is None:
+            plugin_registry.auto_discover(Path(__file__).parent.parent / "plugins")
+            method = getattr(self.config, "risk_method", "weighted_sum")
+            if plugin_registry.has(method):
+                self.register_calculator(plugin_registry.create(method))
+            else:
+                from murasa.plugins.calculators import WeightedSumCalculator
+                self.register_calculator(WeightedSumCalculator())
+            logger.info(f"Auto-selected calculator: {self.calculator.name}")
+
         self.normalize_weights()
         self.exclusion_mask = np.zeros(self.grid_shape, dtype=bool)
 
-        risk_components = []
-
+        results_map = {}
         for plugin in self.parameters:
-            try:
-                component = plugin.process(
-                    self.registry,
-                    self.grid_shape,
-                    self.transform,
-                    self.crs
-                )
+            component = self._process_parameter(plugin)
+            if component is not None:
+                results_map[plugin.name] = component
 
-                output_name = f"risk_{plugin.name}"
-                self.registry.register(
-                    output_name,
-                    DataSource(output_name, SourceType.RASTER, data=component, crs=self.crs)
-                )
+        if not results_map:
+            raise ValueError("No valid risk parameter results computed!")
 
-                if plugin.is_exclusion:
-                    mask = (component > 0).astype(bool)
-                    self.exclusion_mask |= mask
-                    logger.info(f"      Added exclusion mask from {plugin.name}: {mask.sum()} pixels")
-                else:
-                    component = np.nan_to_num(component, nan=0.0)
-                    weighted = component * plugin.weight
-                    risk_components.append(weighted)
-
-            except Exception as e:
-                logger.error(f"      Failed: {e}")
-                import traceback
-                traceback.print_exc()
-                continue
-
-        if not risk_components:
-            raise ValueError("No valid risk components computed!")
-
-        self.risk_raster = np.sum(risk_components, axis=0).astype(np.float32)
+        active_parameters = [p for p in self.parameters if not p.is_exclusion]
+        self.risk_raster = self.calculator.calculate(
+            active_parameters,
+            results_map,
+            self.grid_shape
+        )
 
         if self.exclusion_mask.any():
             self.risk_raster[self.exclusion_mask] = np.nan
@@ -181,18 +321,44 @@ class RiskEngine:
             self.risk_raster[~self.study_area_mask] = np.nan
 
         log_section("RISK CALCULATION COMPLETE")
-        logger.info(f"Range: {np.nanmin(self.risk_raster):.3f} - "
-                    f"{np.nanmax(self.risk_raster):.3f}")
+        logger.info(f"Range: {np.nanmin(self.risk_raster):.3f} - {np.nanmax(self.risk_raster):.3f}")
         logger.info(f"Mean: {np.nanmean(self.risk_raster):.3f}")
 
         return self.risk_raster
+
+    def _process_parameter(self, plugin: ParameterPlugin) -> Optional[np.ndarray]:
+        try:
+            component = plugin.process(
+                self.registry,
+                self.grid_shape,
+                self.transform,
+                self.crs
+            )
+
+            if plugin.is_exclusion:
+                mask = (np.nan_to_num(component, nan=0.0) > 0).astype(bool)
+                self.exclusion_mask |= mask
+                logger.info(f"      Added exclusion mask from {plugin.name}: {mask.sum()} pixels")
+                return None
+
+            component = self.registry.apply_study_area_mask(component)
+            plugin.result = component
+            output_name = f"risk_{plugin.name}"
+            self.registry.register(
+                output_name,
+                DataSource(output_name, SourceType.RASTER, data=component, crs=self.crs)
+            )
+
+            return component
+        except Exception as e:
+            logger.error(f"      Failed: {plugin.name}: {e}")
+            return None
 
     def export_raster(self, output_path: Path) -> None:
         if self.risk_raster is None:
             raise ValueError("No risk raster calculated")
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
-
         profile = {
             'driver': 'GTiff',
             'height': self.grid_shape[0],
@@ -211,8 +377,6 @@ class RiskEngine:
         log_success(f"Raster saved: {output_path}")
 
     def export_statistics(self, output_path: Path) -> None:
-        import json
-
         stats = {
             'parameters': {
                 p.name: {
@@ -240,11 +404,8 @@ class RiskEngine:
             output_dir = self.config.output.output_dir
 
         output_dir.mkdir(parents=True, exist_ok=True)
-
         self.export_raster(output_dir / "risk_map.tif")
-
         self.export_statistics(output_dir / "statistics.json")
-
         log_success(f"All outputs saved to: {output_dir}")
 
         if self.post_processors:
@@ -261,12 +422,9 @@ class RiskEngine:
                     )
                 except Exception as e:
                     logger.error(f"Post-processor {pp.name} failed: {e}")
-                    import traceback
-                    traceback.print_exc()
 
     def print_summary(self) -> None:
         log_section("ENGINE SUMMARY")
-
         logger.info(f"Data sources: {len(self.registry)}")
         self.registry.print_summary()
 
@@ -275,21 +433,33 @@ class RiskEngine:
             logger.info(f"  - {param}")
 
         if self.grid_shape:
-            logger.info(f"\nGrid: {self.grid_shape[1]}×{self.grid_shape[0]} pixels")
+            logger.info(f"\nGrid: {self.grid_shape[1]} x {self.grid_shape[0]} pixels")
             logger.info(f"Resolution: {self.config.spatial.resolution}m")
 
         if self.admin_units is not None:
             logger.info(f"\nStudy area: {len(self.admin_units)} units")
 
     def run(self) -> np.ndarray:
+        """Execute the complete config-driven risk assessment pipeline."""
         log_section("RISK ENGINE - FULL RUN")
 
+        plugins_dir = Path(__file__).parent.parent / "plugins"
         self.auto_register_from_config()
+
+        loader_registry = LoaderRegistry()
+        loader_registry.auto_discover(plugins_dir)
+        loader_registry.load_all(self.config, self.registry)
+
+        if not self.parameters:
+            self.auto_register_parameters_from_config()
+
+        if not self.post_processors:
+            self.auto_register_post_processors_from_config()
+
         self.setup_grid()
         self.set_study_area()
 
         risk = self.calculate_risk()
-
         self.export_all()
 
         log_section("COMPLETE")

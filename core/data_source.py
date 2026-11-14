@@ -12,7 +12,6 @@ from .logger import logger, log_success, log_error
 
 
 class SourceType(Enum):
-    """Supported data source types"""
     RASTER = "raster"
     VECTOR = "vector"
     POINT = "point"
@@ -71,15 +70,32 @@ class DataSource:
 
     def _load_raster(self):
         with rasterio.open(self.path) as src:
-            self.data = src.read(1)
+            raw_data = src.read(1).astype(np.float32)
+
+            nodata = src.nodata if src.nodata is not None else (src.nodatavals[0] if src.nodatavals else -9999.0)
+
+            raw_data[raw_data == nodata] = np.nan
+
+            self.data = raw_data
             self.metadata['transform'] = src.transform
             self.metadata['profile'] = src.profile
             self.metadata['bounds'] = src.bounds
             self.metadata['shape'] = (src.height, src.width)
-            self.crs = str(src.crs)
+            self.metadata['nodata'] = nodata
+
+            if src.crs:
+                self.crs = str(src.crs)
+            else:
+                bounds = src.bounds
+                if bounds and -180 <= bounds.left <= 180 and -180 <= bounds.right <= 180 and -90 <= bounds.bottom <= 90 and -90 <= bounds.top <= 90:
+                    self.crs = "EPSG:4326"
+                    logger.info(f"CRS not set in raster {self.name}, inferred EPSG:4326 from geographic bounds")
+                else:
+                    logger.warning(f"CRS not found in raster metadata for {self.name}, using default: {self.crs}")
 
             logger.debug(f"  Shape: {self.metadata['shape']}")
             logger.debug(f"  CRS: {self.crs}")
+
 
     def _load_vector(self):
         self.data = gpd.read_file(self.path).to_crs(self.crs)
@@ -140,6 +156,14 @@ class DataRegistry:
 
     def __init__(self):
         self.sources: Dict[str, DataSource] = {}
+        self.study_area_mask: Optional[np.ndarray] = None
+
+    def apply_study_area_mask(self, data: np.ndarray) -> np.ndarray:
+        if self.study_area_mask is not None and self.study_area_mask.shape == data.shape:
+            masked = data.astype(np.float32, copy=True)
+            masked[~self.study_area_mask] = np.nan
+            return masked
+        return data
 
     def register(self, name: str, source: DataSource) -> None:
         if name in self.sources:

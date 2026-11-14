@@ -6,7 +6,7 @@ def percentile(data: np.ndarray,
                lower: float = 5,
                upper: float = 95) -> np.ndarray:
     """
-    Percentile-based normalization (robust to outliers).
+    Percentile-based normalization.
 
     Args:
         data: Input array
@@ -23,7 +23,9 @@ def percentile(data: np.ndarray,
     d_min, d_max = np.percentile(data[valid], [lower, upper])
 
     if d_max == d_min:
-        return np.full_like(data, 0.5, dtype=np.float32)
+        result = np.full_like(data, np.nan, dtype=np.float32)
+        result[valid] = 0.5
+        return result
 
     normalized = np.clip((data - d_min) / (d_max - d_min), 0, 1)
     return normalized.astype(np.float32)
@@ -44,7 +46,9 @@ def minmax(data: np.ndarray) -> np.ndarray:
     d_max = np.nanmax(data)
 
     if d_max == d_min:
-        return np.full_like(data, 0.5, dtype=np.float32)
+        result = np.full_like(data, np.nan, dtype=np.float32)
+        result[valid] = 0.5
+        return result
 
     normalized = (data - d_min) / (d_max - d_min)
     return normalized.astype(np.float32)
@@ -95,7 +99,9 @@ def zscore(data: np.ndarray,
     std = np.nanstd(data)
 
     if std == 0:
-        return np.full_like(data, 0.5, dtype=np.float32)
+        result = np.full_like(data, np.nan, dtype=np.float32)
+        result[valid] = 0.5
+        return result
 
     z = (data - mean) / std
     z = np.clip(z, -clip_sigma, clip_sigma)
@@ -157,7 +163,8 @@ def classify_jenks(data: np.ndarray,
 
     values = data[valid]
     if len(values) > sample_size:
-        sample = np.random.choice(values, sample_size, replace=False)
+        rng = np.random.default_rng(42)
+        sample = rng.choice(values, sample_size, replace=False)
     else:
         sample = values
 

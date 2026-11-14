@@ -1,19 +1,18 @@
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List
 import geopandas as gpd
 import fiona
 import pandas as pd
 
 from murasa.core.base import DataLoaderPlugin
 from murasa.core.data_source import DataRegistry, DataSource, SourceType
+from murasa.core.file_scanner import _match_pattern
 from murasa.core.logger import log_success, log_warning
 
 
 class LandUseLoader(DataLoaderPlugin):
     """
-    Load land use/land cover data from RBI directories
-    
-    Categories: settlement, forest, shrub, plantation, paddy, water, roads
+    Loads and standardizes land use data from RBI.
     """
 
     provides = [
@@ -58,7 +57,8 @@ class LandUseLoader(DataLoaderPlugin):
 
     def __init__(self, config):
         super().__init__("LandUseLoader")
-        self.admin_dirs = [Path(d) for d in config.paths.admin_dirs]
+        dirs = config.paths.get("admin_dirs") or []
+        self.admin_dirs = [Path(d) for d in dirs]
         self.target_crs = config.spatial.target_crs
         self.patterns = self.DEFAULT_PATTERNS
         self.load_roads = True
@@ -66,18 +66,14 @@ class LandUseLoader(DataLoaderPlugin):
 
     @classmethod
     def can_handle(cls, config) -> bool:
-        """Check if admin directories are configured"""
-        return config.paths.admin_dirs is not None and len(config.paths.admin_dirs) > 0
+        return bool(config.paths.get("admin_dirs"))
 
     def load(self, registry: DataRegistry) -> Dict[str, DataSource]:
-        """Load all land use categories and register to registry"""
         self.log_loading("Loading land use data...")
-
         results = {}
 
         for category, patterns in self.patterns.items():
             gdf = self._load_layers(patterns)
-
             if not gdf.empty:
                 source_name = f"landuse_{category}"
                 source = DataSource(
@@ -95,7 +91,6 @@ class LandUseLoader(DataLoaderPlugin):
 
         if self.load_roads:
             gdf_roads = self._load_roads_as_polygons()
-
             if not gdf_roads.empty:
                 source = DataSource(
                     name="landuse_road",
@@ -110,11 +105,9 @@ class LandUseLoader(DataLoaderPlugin):
 
         self.loaded_sources = results
         log_success(f"Loaded {len(results)} land use categories")
-
         return results
 
     def _load_layers(self, filename_patterns: List[str]) -> gpd.GeoDataFrame:
-        """Scan all admin dirs for files matching patterns and merge them"""
         frames = []
 
         for admin_dir in self.admin_dirs:
@@ -122,7 +115,7 @@ class LandUseLoader(DataLoaderPlugin):
                 continue
 
             for shp_file in admin_dir.glob("*.shp"):
-                if self._match_pattern(shp_file.name, filename_patterns):
+                if _match_pattern(shp_file.name, filename_patterns):
                     try:
                         gdf = gpd.read_file(shp_file).to_crs(self.target_crs)
                         gdf = self._standardize_columns(gdf, shp_file.stem)
@@ -132,9 +125,8 @@ class LandUseLoader(DataLoaderPlugin):
 
             for gdb_dir in admin_dir.glob("*.gdb"):
                 try:
-                    layers = fiona.listlayers(str(gdb_dir))
-                    for layer in layers:
-                        if self._match_pattern(layer, filename_patterns):
+                    for layer in fiona.listlayers(str(gdb_dir)):
+                        if _match_pattern(layer, filename_patterns):
                             try:
                                 gdf = gpd.read_file(gdb_dir, layer=layer).to_crs(self.target_crs)
                                 gdf = self._standardize_columns(gdf, layer)
@@ -150,76 +142,26 @@ class LandUseLoader(DataLoaderPlugin):
         return gpd.GeoDataFrame(pd.concat(frames, ignore_index=True), crs=self.target_crs)
 
     def _load_roads_as_polygons(self) -> gpd.GeoDataFrame:
-        """Load road line features and buffer them to polygons"""
-        frames = []
-
-        for admin_dir in self.admin_dirs:
-            if not admin_dir.exists():
-                continue
-
-            for shp_file in admin_dir.glob("*.shp"):
-                if self._match_pattern(shp_file.name, self.ROAD_PATTERNS):
-                    try:
-                        gdf = gpd.read_file(shp_file).to_crs(self.target_crs)
-                        gdf = self._standardize_columns(gdf, shp_file.stem)
-                        frames.append(gdf)
-                    except Exception as e:
-                        log_warning(f"Failed to load road SHP {shp_file.name}: {e}")
-
-            for gdb_dir in admin_dir.glob("*.gdb"):
-                try:
-                    layers = fiona.listlayers(str(gdb_dir))
-                    for layer in layers:
-                        if self._match_pattern(layer, self.ROAD_PATTERNS):
-                            try:
-                                gdf = gpd.read_file(gdb_dir, layer=layer).to_crs(self.target_crs)
-                                gdf = self._standardize_columns(gdf, layer)
-                                frames.append(gdf)
-                            except:
-                                pass
-                except:
-                    pass
-
-        if not frames:
+        gdf_lines = self._load_layers(self.ROAD_PATTERNS)
+        if gdf_lines.empty:
             return gpd.GeoDataFrame()
 
-        gdf_lines = gpd.GeoDataFrame(pd.concat(frames, ignore_index=True), crs=self.target_crs)
-
         gdf_metric = gdf_lines.to_crs("EPSG:3857")
-
-        gdf_metric['geometry'] = gdf_metric.apply(
-            lambda row: row.geometry.buffer(self._get_road_width(row.get('REMARK', ''))),
-            axis=1
-        )
-
+        widths = gdf_metric['REMARK'].map(self._get_road_width)
+        gdf_metric['geometry'] = gdf_metric.geometry.buffer(widths)
         return gdf_metric.to_crs(self.target_crs)
 
     def _get_road_width(self, remark) -> float:
-        """Determine road buffer width based on REMARK field"""
         if not isinstance(remark, str):
             return self.road_widths.get('default', 3.0)
-
         r = remark.lower()
-
-        if 'tol' in r:
-            return self.road_widths.get('tol', 12.0)
-        if 'arteri' in r:
-            return self.road_widths.get('arteri', 8.0)
-        if 'kolektor' in r:
-            return self.road_widths.get('kolektor', 5.0)
-        if 'lokal' in r:
-            return self.road_widths.get('lokal', 3.5)
-
+        for key in ('tol', 'arteri', 'kolektor', 'lokal'):
+            if key in r:
+                return self.road_widths.get(key, 3.0)
         return self.road_widths.get('default', 3.0)
 
-    def _match_pattern(self, filename: str, patterns: List[str]) -> bool:
-        fname = filename.upper()
-        return any(p.upper() in fname for p in patterns)
-
     def _standardize_columns(self, gdf: gpd.GeoDataFrame, source_name: str) -> gpd.GeoDataFrame:
-        """Standardize column names across different data sources"""
         rename_map = {}
-
         for col in gdf.columns:
             c = col.upper()
             if 'NAMOBJ' in c:
@@ -228,10 +170,8 @@ class LandUseLoader(DataLoaderPlugin):
                 rename_map[col] = 'REMARK'
 
         gdf = gdf.rename(columns=rename_map)
-
         if 'NAMOBJ' not in gdf.columns:
             gdf['NAMOBJ'] = 'Unknown'
         if 'REMARK' not in gdf.columns:
             gdf['REMARK'] = source_name
-
         return gdf

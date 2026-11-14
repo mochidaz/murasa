@@ -1,5 +1,5 @@
 project:
-  name: "Bandung Raya Flood Susceptibility Analysis (December)"
+  name: "Bandung Raya Flood Susceptibility Analysis"
   description: "Analyzes stuff"
 
 spatial:
@@ -12,7 +12,7 @@ paths:
   dem: "../../data/DEMNAS/merged/new2026/filled_dem_tif.tif"
   slope: "../../data/DEMNAS/merged/new2026/filled_slope_tif.tif"
   twi: "../../data/DEMNAS/merged/new2026/twi.tif"
-  rainfall: "../../data/bmkg_rainfall_data/curah-hujan-oktober-2025.geojson"
+  rainfall: "../../data/chirps/v2p0chirps202512/v2p0chirps202512.bil"
   admin_dirs:
     - "../../data/wilayah-administrasi/KAB. BANDUNG"
     - "../../data/wilayah-administrasi/KAB. BANDUNG BARAT"
@@ -31,19 +31,11 @@ weights:
 
 parameters:
   rainfall:
-    column_name: "gridcode"
+    weight: 0.15
+    group: "hazard"
     year: 2025
-    month: 10
-    value_mapping:
-      1: 10
-      2: 35
-      3: 75
-      4: 125
-      5: 175
-      6: 250
-      7: 350
-      8: 450
-      9: 600
+    month: 12
+
 
   land_use:
     coefficients:
