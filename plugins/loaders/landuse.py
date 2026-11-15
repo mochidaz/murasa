@@ -6,7 +6,7 @@ import pandas as pd
 
 from murasa.core.base import DataLoaderPlugin
 from murasa.core.data_source import DataRegistry, DataSource, SourceType
-from murasa.core.file_scanner import _match_pattern
+from murasa.core.file_scanner import match_pattern
 from murasa.core.logger import log_success, log_warning
 
 
@@ -46,6 +46,9 @@ class LandUseLoader(DataLoaderPlugin):
     }
 
     ROAD_PATTERNS = ['JALAN_LN', 'JALAN']
+
+    # BIG Rupabumi Indonesia (RBI) layers often prepend AGRI/NONAGRI to land-use names
+    RBI_PREFIXES = ('NONAGRI', 'AGRI')
 
     ROAD_WIDTHS = {
         'tol': 12.0,
@@ -115,7 +118,7 @@ class LandUseLoader(DataLoaderPlugin):
                 continue
 
             for shp_file in admin_dir.glob("*.shp"):
-                if _match_pattern(shp_file.name, filename_patterns):
+                if match_pattern(shp_file.name, filename_patterns, prefixes=self.RBI_PREFIXES):
                     try:
                         gdf = gpd.read_file(shp_file).to_crs(self.target_crs)
                         gdf = self._standardize_columns(gdf, shp_file.stem)
@@ -126,7 +129,7 @@ class LandUseLoader(DataLoaderPlugin):
             for gdb_dir in admin_dir.glob("*.gdb"):
                 try:
                     for layer in fiona.listlayers(str(gdb_dir)):
-                        if _match_pattern(layer, filename_patterns):
+                        if match_pattern(layer, filename_patterns, prefixes=self.RBI_PREFIXES):
                             try:
                                 gdf = gpd.read_file(gdb_dir, layer=layer).to_crs(self.target_crs)
                                 gdf = self._standardize_columns(gdf, layer)

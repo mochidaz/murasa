@@ -19,11 +19,11 @@ __all__ = [
     'log_warning',
     'ProcessingContext',
     'percentile', 'minmax', 'rank', 'zscore', 'invert',
-    'scan_shapefiles', 'scan_gdb_layers', 'scan_all',
+    'scan_shapefiles', 'scan_gdb_layers', 'scan_all', 'scan_filename', 'match_pattern',
     'LoaderRegistry',
     'RasterParameterPlugin'
 ]
 
 from .processing import ProcessingContext
 from .normalize import percentile, minmax, rank, zscore, invert, classify_quantile, classify_jenks
-from .file_scanner import scan_shapefiles, scan_gdb_layers, scan_all, scan_filename
+from .file_scanner import scan_shapefiles, scan_gdb_layers, scan_all, scan_filename, match_pattern

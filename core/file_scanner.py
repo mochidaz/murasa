@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Sequence
 import re
 
 import geopandas as gpd
@@ -10,7 +10,8 @@ from .logger import logger, log_warning
 
 def scan_shapefiles(directories: List[Path],
                     patterns: List[str],
-                    target_crs: str = "EPSG:4326") -> gpd.GeoDataFrame:
+                    target_crs: str = "EPSG:4326",
+                    prefixes: Optional[Sequence[str]] = None) -> gpd.GeoDataFrame:
     """
     Scan directories for shapefiles matching pattern names.
     """
@@ -22,7 +23,7 @@ def scan_shapefiles(directories: List[Path],
             continue
 
         for shp_file in directory.glob("*.shp"):
-            if _match_pattern(shp_file.name, patterns):
+            if match_pattern(shp_file.name, patterns, prefixes=prefixes):
                 try:
                     gdf = gpd.read_file(shp_file).to_crs(target_crs)
                     frames.append(gdf)
@@ -35,7 +36,8 @@ def scan_shapefiles(directories: List[Path],
 
 def scan_gdb_layers(directories: List[Path],
                     patterns: List[str],
-                    target_crs: str = "EPSG:4326") -> gpd.GeoDataFrame:
+                    target_crs: str = "EPSG:4326",
+                    prefixes: Optional[Sequence[str]] = None) -> gpd.GeoDataFrame:
     """
     Scan directories for GDB layers matching pattern names.
     """
@@ -56,7 +58,7 @@ def scan_gdb_layers(directories: List[Path],
             try:
                 layers = fiona.listlayers(str(gdb_dir))
                 for layer in layers:
-                    if _match_pattern(layer, patterns):
+                    if match_pattern(layer, patterns, prefixes=prefixes):
                         try:
                             gdf = gpd.read_file(gdb_dir, layer=layer).to_crs(target_crs)
                             frames.append(gdf)
@@ -73,12 +75,13 @@ def scan_gdb_layers(directories: List[Path],
 
 def scan_all(directories: List[Path],
              patterns: List[str],
-             target_crs: str = "EPSG:4326") -> gpd.GeoDataFrame:
+             target_crs: str = "EPSG:4326",
+             prefixes: Optional[Sequence[str]] = None) -> gpd.GeoDataFrame:
     """
     Scan directories for both shapefiles and GDB layers matching pattern names.
     """
-    gdf_shp = scan_shapefiles(directories, patterns, target_crs)
-    gdf_gdb = scan_gdb_layers(directories, patterns, target_crs)
+    gdf_shp = scan_shapefiles(directories, patterns, target_crs, prefixes=prefixes)
+    gdf_gdb = scan_gdb_layers(directories, patterns, target_crs, prefixes=prefixes)
 
     frames = []
     if not gdf_shp.empty:
@@ -120,12 +123,33 @@ def scan_filename(directories: List[Path],
     return _merge_frames(frames, target_crs)
 
 
-def _match_pattern(name: str, patterns: List[str]) -> bool:
-    name_upper = name.upper()
-    return any(
-        re.search(r"(?:^|_|NONAGRI|AGRI)" + re.escape(p.upper()), name_upper) is not None
-        for p in patterns
-    )
+def match_pattern(
+    name: str,
+    patterns: Sequence[str],
+    prefixes: Optional[Sequence[str]] = None,
+) -> bool:
+    """
+    Check if a filename stem or layer name matches any pattern at a token boundary.
+    """
+    if not patterns:
+        return False
+
+    stem = Path(name).stem.upper()
+    prefix_expr = ""
+    if prefixes:
+        ordered = sorted({pr.upper() for pr in prefixes if pr}, key=len, reverse=True)
+        if ordered:
+            prefix_expr = f"(?:{'|'.join(re.escape(pr) for pr in ordered)})?"
+
+    pattern_expr = "|".join(re.escape(p.upper()) for p in patterns if p)
+    if not pattern_expr:
+        return False
+
+    regex = re.compile(rf"(?:^|[^A-Z0-9]){prefix_expr}(?:{pattern_expr})")
+    return regex.search(stem) is not None
+
+
+_match_pattern = match_pattern
 
 
 def _merge_frames(frames: list, target_crs: str) -> gpd.GeoDataFrame:
