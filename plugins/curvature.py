@@ -1,6 +1,7 @@
 import numpy as np
 from murasa.core.base import ParameterPlugin, register_plugin
 from murasa.core.data_source import DataRegistry
+from murasa.core.processing import cell_size_in_meters
 from murasa.core.resampler import RasterResampler
 from murasa.core.logger import logger
 
@@ -38,7 +39,7 @@ class CurvaturePlugin(ParameterPlugin):
             curvature = resampler.resample(registry.get('curvature'))
         else:
             logger.info("      Computing curvature from DEM...")
-            curvature = self._compute_from_dem(registry, resampler, transform)
+            curvature = self._compute_from_dem(registry, resampler, transform, grid_shape, crs)
 
         curvature = registry.apply_study_area_mask(curvature)
         normalized = self._normalize_curvature(curvature)
@@ -48,11 +49,11 @@ class CurvaturePlugin(ParameterPlugin):
         self.log_result()
         return self.result
 
-    def _compute_from_dem(self, registry, resampler, transform):
+    def _compute_from_dem(self, registry, resampler, transform, grid_shape=None, crs="EPSG:4326"):
         from murasa.core.terrain import calculate_curvature
         dem = resampler.resample(registry.get('dem'))
-        cell_size = abs(transform[0])
-        return calculate_curvature(dem, cell_size, method=self.curvature_type)
+        dx_m, dy_m = cell_size_in_meters(transform, grid_shape or dem.shape, crs)
+        return calculate_curvature(dem, (dy_m, dx_m), method=self.curvature_type)
 
     def _normalize_curvature(self, curvature):
         """Normalize curvature to 0-1 where concave (negative) maps toward 1.0."""
@@ -116,8 +117,8 @@ class SlopeAspectPlugin(ParameterPlugin):
     def _compute_aspect(self, registry, resampler):
         from murasa.core.terrain import calculate_aspect
         dem = resampler.resample(registry.get('dem'))
-        cell_size = abs(resampler.transform[0])
-        return calculate_aspect(dem, cell_size)
+        dx_m, dy_m = cell_size_in_meters(resampler.transform, resampler.grid_shape, resampler.crs)
+        return calculate_aspect(dem, (dy_m, dx_m))
 
     def _aspect_to_risk(self, aspect):
         risk = np.zeros_like(aspect)

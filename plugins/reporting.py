@@ -16,6 +16,7 @@ from murasa.core.analysis import calculate_zonal_stats
 from murasa.core.data_source import DataRegistry, SourceType
 from murasa.core.logger import logger
 from murasa.core.base import PostProcessorPlugin, ParameterPlugin, register_plugin, plugin_registry
+from murasa.core.processing import resolve_metric_crs
 
 
 """
@@ -265,7 +266,8 @@ class VectorExplainabilityPlugin(PostProcessorPlugin):
         gdf_admin = admin_source.data.to_crs(crs).copy()
 
         if 'area_ha' not in gdf_admin.columns:
-            metric_crs = config.spatial.metric_crs if config and hasattr(config, 'spatial') else "EPSG:3857"
+            cfg_metric_crs = config.spatial.metric_crs if config and hasattr(config, 'spatial') else "auto"
+            metric_crs = resolve_metric_crs(gdf_admin, cfg_metric_crs)
             try:
                 gdf_metric = gdf_admin.to_crs(metric_crs)
                 gdf_admin['area_ha'] = (gdf_metric.geometry.area / 10000.0).round(2)

@@ -8,6 +8,7 @@ from murasa.core.base import DataLoaderPlugin
 from murasa.core.data_source import DataRegistry, DataSource, SourceType
 from murasa.core.file_scanner import match_pattern
 from murasa.core.logger import log_success, log_warning
+from murasa.core.processing import resolve_metric_crs
 
 
 class LandUseLoader(DataLoaderPlugin):
@@ -63,6 +64,7 @@ class LandUseLoader(DataLoaderPlugin):
         dirs = config.paths.get("admin_dirs") or []
         self.admin_dirs = [Path(d) for d in dirs]
         self.target_crs = config.spatial.target_crs
+        self.metric_crs = getattr(config.spatial, "metric_crs", "auto")
         self.patterns = self.DEFAULT_PATTERNS
         self.load_roads = True
         self.road_widths = self.ROAD_WIDTHS
@@ -149,7 +151,8 @@ class LandUseLoader(DataLoaderPlugin):
         if gdf_lines.empty:
             return gpd.GeoDataFrame()
 
-        gdf_metric = gdf_lines.to_crs("EPSG:3857")
+        metric_crs = resolve_metric_crs(gdf_lines, self.metric_crs)
+        gdf_metric = gdf_lines.to_crs(metric_crs)
         widths = gdf_metric['REMARK'].map(self._get_road_width)
         gdf_metric['geometry'] = gdf_metric.geometry.buffer(widths)
         return gdf_metric.to_crs(self.target_crs)

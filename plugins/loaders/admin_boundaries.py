@@ -2,6 +2,7 @@ import re
 from murasa.core.base import DataLoaderPlugin
 from murasa.core.file_scanner import scan_filename
 from murasa.core.logger import log_success, log_error
+from murasa.core.processing import resolve_metric_crs
 
 
 class AdminBoundariesLoader(DataLoaderPlugin):
@@ -16,7 +17,7 @@ class AdminBoundariesLoader(DataLoaderPlugin):
         super().__init__("AdminBoundariesLoader")
         self.admin_dirs = config.paths.get("admin_dirs") or []
         self.target_crs = config.spatial.target_crs
-        self.metric_crs = getattr(config.spatial, "metric_crs", "EPSG:3857")
+        self.metric_crs = getattr(config.spatial, "metric_crs", "auto")
         self.filter_city = getattr(config.spatial, "filter_city", None)
         self.filter_district = getattr(config.spatial, "filter_district", None)
         self.filename = config.parameters.get("admin_filename", "ADMINISTRASIDESA_AR_25K.shp")
@@ -51,7 +52,8 @@ class AdminBoundariesLoader(DataLoaderPlugin):
 
         if not gdf.empty and all(c in gdf.columns for c in ("WADMKK", "WADMKC", "NAMOBJ")):
             try:
-                areas_ha = gdf.to_crs(self.metric_crs).geometry.area / 10000.0
+                metric_crs = resolve_metric_crs(gdf, self.metric_crs)
+                areas_ha = gdf.to_crs(metric_crs).geometry.area / 10000.0
             except Exception:
                 areas_ha = gdf.geometry.area
             gdf["_tmp_area"] = areas_ha

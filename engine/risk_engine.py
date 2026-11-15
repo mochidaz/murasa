@@ -6,10 +6,12 @@ import geopandas as gpd
 import rasterio
 from rasterio.transform import from_bounds
 from rasterio.features import geometry_mask
+from rasterio.warp import calculate_default_transform
 
 from murasa.core.config import EngineConfig, infer_source_type
 from murasa.core.data_source import DataRegistry, DataSource, SourceType
 from murasa.core.logger import logger, log_section, log_subsection, log_success
+from murasa.core.processing import crs_equal, meters_to_crs_units
 from murasa.core.base import (
     ParameterPlugin,
     PostProcessorPlugin,
@@ -232,28 +234,50 @@ class RiskEngine:
 
         if target_path and target_path.exists():
             with rasterio.open(target_path) as src:
-                self.transform = src.transform
-                self.grid_shape = (src.height, src.width)
-                logger.info(f"Grid shape and transform aligned with reference raster: '{target_path.name}'")
+                if src.crs and not crs_equal(src.crs, self.crs):
+                    dst_transform, dst_width, dst_height = calculate_default_transform(
+                        src.crs, self.crs, src.width, src.height, *src.bounds
+                    )
+                    self.transform = dst_transform
+                    self.grid_shape = (dst_height, dst_width)
+                    logger.info(
+                        f"Grid reprojected from reference raster '{target_path.name}' "
+                        f"({src.crs} -> {self.crs})"
+                    )
+                else:
+                    self.transform = src.transform
+                    self.grid_shape = (src.height, src.width)
+                    logger.info(f"Grid shape and transform aligned with reference raster: '{target_path.name}'")
                 log_success(f"Grid: {self.grid_shape[1]} x {self.grid_shape[0]} pixels")
                 return
 
         study_area_key = self.config.spatial.study_area_key
         if bounds is None and self.registry.has(study_area_key):
             admin_source = self.registry.get(study_area_key)
-            bounds = admin_source.data.total_bounds
+            admin_data = admin_source.data
+            if getattr(admin_data, "crs", None) and not crs_equal(admin_data.crs, self.crs):
+                admin_data = admin_data.to_crs(self.crs)
+            bounds = admin_data.total_bounds
             logger.info(f"Grid bounds generated from vector {study_area_key} data")
 
         if bounds is None:
             raise ValueError("Grid bounds required (provide bounds or reference_raster)")
 
         resolution = self.config.spatial.resolution
-        width = int((bounds[2] - bounds[0]) / resolution)
-        height = int((bounds[3] - bounds[1]) / resolution)
+        resolution_unit = getattr(self.config.spatial, "resolution_unit", "meter")
+        if resolution_unit == "crs":
+            res_x = res_y = float(resolution)
+            unit_label = " CRS units"
+        else:
+            res_x, res_y = meters_to_crs_units(resolution, self.crs, bounds=bounds)
+            unit_label = "m"
+
+        width = max(1, int(round((bounds[2] - bounds[0]) / res_x)))
+        height = max(1, int(round((bounds[3] - bounds[1]) / res_y)))
 
         self.transform = from_bounds(*bounds, width, height)
         self.grid_shape = (height, width)
-        log_success(f"Grid: {width} x {height} pixels @ {resolution}m")
+        log_success(f"Grid: {width} x {height} pixels @ {resolution}{unit_label}")
 
     def set_study_area(self, admin_gdf: Optional[gpd.GeoDataFrame] = None) -> None:
         """Rasterize the study area boundary polygon into a boolean mask."""
@@ -263,6 +287,9 @@ class RiskEngine:
                 logger.warning(f"No study area defined using key '{study_area_key}', processing full grid")
                 return
             admin_gdf = self.registry.get(study_area_key).data
+
+        if getattr(admin_gdf, "crs", None) and not crs_equal(admin_gdf.crs, self.crs):
+            admin_gdf = admin_gdf.to_crs(self.crs)
 
         self.admin_units = admin_gdf
         self.study_area_mask = geometry_mask(
@@ -433,8 +460,9 @@ class RiskEngine:
             logger.info(f"  - {param}")
 
         if self.grid_shape:
+            res_unit = "m" if getattr(self.config.spatial, "resolution_unit", "meter") == "meter" else " CRS units"
             logger.info(f"\nGrid: {self.grid_shape[1]} x {self.grid_shape[0]} pixels")
-            logger.info(f"Resolution: {self.config.spatial.resolution}m")
+            logger.info(f"Resolution: {self.config.spatial.resolution}{res_unit}")
 
         if self.admin_units is not None:
             logger.info(f"\nStudy area: {len(self.admin_units)} units")

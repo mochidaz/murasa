@@ -40,12 +40,25 @@ class FactorConfig:
             self.source_path = Path(self.source_path)
 
 
+def _normalize_resolution_unit(unit: str) -> str:
+    """Validate and canonicalize SpatialConfig.resolution_unit ('meter' or 'crs')."""
+    normalized = str(unit).strip().lower()
+    if normalized in ("m", "meter", "meters"):
+        return "meter"
+    if normalized in ("crs",):
+        return "crs"
+    raise ValueError(
+        f"Invalid resolution_unit '{unit}'. Expected 'meter' or 'crs'."
+    )
+
+
 @dataclass
 class SpatialConfig:
     """Spatial grid, projection, and generic study area filter configuration."""
     target_crs: str = "EPSG:4326"
-    metric_crs: str = "EPSG:3857"
+    metric_crs: str = "auto"
     resolution: float = 10.0
+    resolution_unit: str = "meter"
     study_area_key: str = "admin"
     reference_raster: Optional[str] = None
     filters: Dict[str, Any] = field(default_factory=dict)
@@ -53,16 +66,21 @@ class SpatialConfig:
     def __init__(
         self,
         target_crs: str = "EPSG:4326",
-        metric_crs: str = "EPSG:3857",
+        metric_crs: str = "auto",
         resolution: float = 10.0,
+        resolution_unit: str = "meter",
         study_area_key: str = "admin",
         reference_raster: Optional[str] = None,
         filters: Optional[Dict[str, Any]] = None,
         **kwargs
     ):
+        res_val = float(resolution)
+        if res_val <= 0:
+            raise ValueError(f"Spatial resolution must be positive, got {resolution}")
         self.target_crs = target_crs
         self.metric_crs = metric_crs
-        self.resolution = resolution
+        self.resolution = res_val
+        self.resolution_unit = _normalize_resolution_unit(resolution_unit)
         self.study_area_key = study_area_key
         self.reference_raster = reference_raster
         self.filters = dict(filters or {})
@@ -407,6 +425,7 @@ class EngineConfig:
                 'target_crs': self.spatial.target_crs,
                 'metric_crs': self.spatial.metric_crs,
                 'resolution': self.spatial.resolution,
+                'resolution_unit': self.spatial.resolution_unit,
                 'reference_raster': self.spatial.reference_raster,
                 'study_area_key': self.spatial.study_area_key,
                 **self.spatial.filters,

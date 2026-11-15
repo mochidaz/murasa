@@ -30,7 +30,7 @@ class SlopePlugin(RasterParameterPlugin):
         else:
             dem = ctx.resample_raster(registry.get('dem'))
             from murasa.core.terrain import calculate_slope
-            slope = calculate_slope(dem, ctx.resolution)
+            slope = calculate_slope(dem, ctx.cell_size_m)
 
         slope = registry.apply_study_area_mask(slope)
         valid = np.isfinite(slope)
