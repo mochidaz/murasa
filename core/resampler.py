@@ -6,7 +6,7 @@ from rasterio.enums import Resampling
 from rasterio.features import rasterize
 from rasterio.warp import reproject
 
-from murasa.core.data_source import DataSource
+from murasa.core.data_source import DataSource, read_raster_band_as_float32
 
 
 class BaseResampler(ABC):
@@ -27,7 +27,8 @@ class BaseResampler(ABC):
         pass
 
     def fill_nodata(self, data: np.ndarray, fill_value=0.0) -> np.ndarray:
-        pass
+        arr = np.asarray(data, dtype=np.float32)
+        return np.where(np.isfinite(arr), arr, np.float32(fill_value))
 
 
 class RasterResampler(BaseResampler):
@@ -69,12 +70,18 @@ class RasterResampler(BaseResampler):
         resampling = self._get_resampling_method()
 
         if source.is_loaded() and isinstance(source.data, np.ndarray):
-            src_data = source.data
+            src_data = np.asarray(source.data, dtype=np.float32)
+            nodata_val = source.metadata.get('nodata') if isinstance(source.metadata, dict) else None
+            if nodata_val is not None and np.isfinite(nodata_val):
+                nodata_f32 = np.float32(nodata_val)
+                if np.any(src_data == nodata_f32):
+                    src_data = src_data.copy()
+                    src_data[src_data == nodata_f32] = np.nan
             src_transform = source.metadata.get('transform')
             src_crs = source.crs
         else:
             with rasterio.open(source.path) as src:
-                src_data = src.read(1).astype(np.float32)
+                src_data, _ = read_raster_band_as_float32(src, band=1)
                 src_transform = src.transform
                 src_crs = src.crs or source.crs or "EPSG:4326"
 

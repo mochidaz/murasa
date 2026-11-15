@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Tuple, Union
 from enum import Enum
 
 import numpy as np
@@ -9,6 +9,28 @@ import geopandas as gpd
 import rasterio
 
 from .logger import logger, log_success, log_error
+
+
+def read_raster_band_as_float32(
+    src: rasterio.DatasetReader,
+    band: int = 1,
+    fallback_nodata: float = -9999.0,
+) -> Tuple[np.ndarray, Optional[float]]:
+    """
+    Read a raster band as float32 with explicit, GDAL-masked, or fallback nodata converted to NaN.
+    """
+    header_nodata = src.nodata
+    if header_nodata is None and src.nodatavals:
+        header_nodata = next((v for v in src.nodatavals if v is not None), None)
+
+    masked = src.read(band, masked=True)
+    data = np.asarray(masked.astype(np.float32).filled(np.nan), dtype=np.float32)
+
+    effective_nodata = header_nodata if header_nodata is not None else fallback_nodata
+    if effective_nodata is not None and np.isfinite(effective_nodata):
+        data[data == np.float32(effective_nodata)] = np.nan
+
+    return data, effective_nodata
 
 
 class SourceType(Enum):
@@ -70,11 +92,7 @@ class DataSource:
 
     def _load_raster(self):
         with rasterio.open(self.path) as src:
-            raw_data = src.read(1).astype(np.float32)
-
-            nodata = src.nodata if src.nodata is not None else (src.nodatavals[0] if src.nodatavals else -9999.0)
-
-            raw_data[raw_data == nodata] = np.nan
+            raw_data, nodata = read_raster_band_as_float32(src, band=1)
 
             self.data = raw_data
             self.metadata['transform'] = src.transform
