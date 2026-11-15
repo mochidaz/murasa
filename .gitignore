@@ -8,7 +8,6 @@ murasa.egg-info
 presets
 examples/run_batch_monthly.py
 examples/upload_to_postgis.py
-tests/
 examples/verify_bnpb_formula.py
 examples/run_landslide_focal_hotspots.py
 examples/run_landslide_hotspots.py

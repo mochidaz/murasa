@@ -58,11 +58,10 @@ class WeightedSumCalculator(RiskCalculatorPlugin):
 @register_plugin("bnpb")
 class BNPBCalculator(RiskCalculatorPlugin):
     """
-    BNPB disaster risk formula
+    BNPB disaster risk formula (RBI 2023, p. 55; p. 134).
 
-    Risk = Hazard * (Vulnerability / Capacity).
-
-    Not normalized to 0.0-1.0 yet. This will be fixed later.
+    Risk = (Hazard * Vulnerability * (1 - Capacity)) ** (1 / 3)
+    Inputs H, V, C and output Risk are in [0.0, 1.0].
     """
 
     def __init__(self):
@@ -89,16 +88,17 @@ class BNPBCalculator(RiskCalculatorPlugin):
         scores = {}
         for group_name, components in groups.items():
             if not components:
-                logger.warning(f"No parameters for group '{group_name}', defaulting to 1.0")
-                scores[group_name] = np.ones(grid_shape, dtype=np.float32)
+                default_val = 0.0 if group_name == 'capacity' else 1.0
+                logger.warning(f"No parameters for group '{group_name}', defaulting to {default_val}")
+                scores[group_name] = np.full(grid_shape, default_val, dtype=np.float32)
                 continue
 
             scores[group_name] = _weighted_nanmean(components, grid_shape)
             logger.info(f"   Group '{group_name}' calculated (parameters: {len(components)})")
 
-        H = scores['hazard']
-        V = scores['vulnerability']
-        C = np.clip(scores['capacity'], 0.01, 1.0)
+        H = np.clip(scores['hazard'], 0.0, 1.0).astype(np.float64)
+        V = np.clip(scores['vulnerability'], 0.0, 1.0).astype(np.float64)
+        C = np.clip(scores['capacity'], 0.0, 1.0).astype(np.float64)
 
-        risk = H * (V / C)
+        risk = np.cbrt(H * V * (1.0 - C))
         return risk.astype(np.float32)
