@@ -18,6 +18,7 @@ from murasa.core.base import (
     RiskCalculatorPlugin,
     LoaderRegistry,
     plugin_registry,
+    resolve_plugin_dirs,
 )
 
 
@@ -98,58 +99,116 @@ class RiskEngine:
 
         log_success(f"Registered {len(self.registry)} data sources")
 
+    def _discover_plugins(self) -> List[Path]:
+        """Auto-discover plugins across internal, custom, and configured directories."""
+        extra_dirs = getattr(self.config, "plugin_dirs", None) or []
+        dirs = resolve_plugin_dirs(extra_dirs=extra_dirs)
+        plugin_registry.auto_discover(dirs)
+        return dirs
+
+    def _build_parameter_plugin(
+        self,
+        factor_name: str,
+        weight: float,
+        group: str = "hazard",
+        explicit_processor: Optional[str] = None,
+        raw_params: Optional[dict] = None,
+    ) -> Optional[ParameterPlugin]:
+        """Resolve and instantiate a ParameterPlugin, honoring YAML plugin/processor aliases."""
+        params = dict(raw_params) if isinstance(raw_params, dict) else {}
+        param_plugin = params.pop("plugin", None)
+        param_processor = params.pop("processor", None)
+        plugin_key = explicit_processor or param_plugin or param_processor or factor_name
+
+        if not plugin_registry.has(plugin_key):
+            return None
+
+        aliased = plugin_key != factor_name
+        if aliased and "name" not in params:
+            params["name"] = factor_name
+
+        plugin = plugin_registry.create(
+            plugin_key,
+            weight=weight,
+            group=group,
+            parameters=params,
+        )
+        if aliased:
+            plugin.name = factor_name
+            if "short_name" not in params:
+                plugin.short_name = factor_name
+            if "contrib_name" not in params:
+                plugin.contrib_name = None
+            if "display_name" not in params:
+                plugin.display_name = factor_name.replace("_", " ").title()
+        return plugin
+
     def auto_register_parameters_from_config(self) -> int:
         """Instantiate and register parameter plugins configured in weights or factors."""
         log_subsection("Auto-registering risk parameter plugins")
-
-        plugins_dir = Path(__file__).parent.parent / "plugins"
-        plugin_registry.auto_discover(plugins_dir)
+        self._discover_plugins()
 
         registered = 0
-        params_cfg = getattr(
-            self.config,
-            "plugin_parameters",
-            getattr(self.config, "parameters", {})
-        ) or {}
+        seen_names: set[str] = set()
+        params_cfg = (
+            getattr(self.config, "plugin_parameters", None)
+            or getattr(self.config, "parameters", None)
+            or {}
+        )
 
-        if hasattr(self.config, "weights") and self.config.weights:
+        if getattr(self.config, "factors", None):
+            for factor_name, factor_cfg in self.config.factors.items():
+                raw_params = {}
+                if isinstance(params_cfg.get(factor_name), dict):
+                    raw_params.update(params_cfg[factor_name])
+                if isinstance(getattr(factor_cfg, "parameters", None), dict):
+                    raw_params.update(factor_cfg.parameters)
+
+                plugin = self._build_parameter_plugin(
+                    factor_name=factor_name,
+                    weight=factor_cfg.weight,
+                    group=getattr(factor_cfg, "group", "hazard"),
+                    explicit_processor=getattr(factor_cfg, "processor", None),
+                    raw_params=raw_params,
+                )
+                if plugin is None:
+                    continue
+                if (factor_cfg.weight is None or factor_cfg.weight <= 0) and not getattr(plugin, "is_exclusion", False):
+                    continue
+                if self.register_parameter(plugin):
+                    registered += 1
+                    seen_names.add(plugin.name)
+
+        elif getattr(self.config, "weights", None):
             for factor_name, weight in self.config.weights.items():
-                if weight is None or weight <= 0 or not plugin_registry.has(factor_name):
+                if weight is None or weight <= 0:
                     continue
                 factor_params = params_cfg.get(factor_name, {})
                 group = factor_params.get("group", "hazard") if isinstance(factor_params, dict) else "hazard"
-                plugin = plugin_registry.create(
-                    factor_name,
+                plugin = self._build_parameter_plugin(
+                    factor_name=factor_name,
                     weight=weight,
                     group=group,
-                    parameters=factor_params if isinstance(factor_params, dict) else {}
+                    raw_params=factor_params if isinstance(factor_params, dict) else {},
                 )
-                if self.register_parameter(plugin):
+                if plugin is not None and self.register_parameter(plugin):
                     registered += 1
-
-        elif hasattr(self.config, "factors") and self.config.factors:
-            for factor_name, factor_cfg in self.config.factors.items():
-                if not plugin_registry.has(factor_name):
-                    continue
-                params = getattr(factor_cfg, "parameters", {}) or {}
-                plugin = plugin_registry.create(
-                    factor_name,
-                    weight=factor_cfg.weight,
-                    group=factor_cfg.group,
-                    parameters=params
-                )
-                if self.register_parameter(plugin):
-                    registered += 1
+                    seen_names.add(plugin.name)
 
         for param_key, param_val in params_cfg.items():
-            if param_key in self.config.weights or not plugin_registry.has(param_key):
+            if param_key in seen_names or (
+                getattr(self.config, "weights", None) and param_key in self.config.weights
+            ):
                 continue
-            cand = plugin_registry.create(
-                param_key,
+            cand = self._build_parameter_plugin(
+                factor_name=param_key,
                 weight=0.0,
-                parameters=param_val if isinstance(param_val, dict) else {}
+                group=param_val.get("group", "hazard") if isinstance(param_val, dict) else "hazard",
+                raw_params=param_val if isinstance(param_val, dict) else {},
             )
-            if getattr(cand, "is_exclusion", False) and not any(p.name == cand.name for p in self.parameters):
+            if cand is not None and getattr(cand, "is_exclusion", False) and not any(
+                p.name == cand.name for p in self.parameters
+            ):
                 self.register_parameter(cand)
 
         logger.info(f"Auto-registered {registered} parameter plugin(s) from config")
@@ -160,8 +219,7 @@ class RiskEngine:
         if not getattr(self.config, "post_processors", None):
             return 0
 
-        plugins_dir = Path(__file__).parent.parent / "plugins"
-        plugin_registry.auto_discover(plugins_dir)
+        self._discover_plugins()
 
         registered = 0
         for item in self.config.post_processors:
@@ -312,7 +370,7 @@ class RiskEngine:
             raise ValueError("Grid not setup (call setup_grid first)")
 
         if self.calculator is None:
-            plugin_registry.auto_discover(Path(__file__).parent.parent / "plugins")
+            self._discover_plugins()
             method = getattr(self.config, "risk_method", "weighted_sum")
             if plugin_registry.has(method):
                 self.register_calculator(plugin_registry.create(method))
@@ -471,11 +529,11 @@ class RiskEngine:
         """Execute the complete config-driven risk assessment pipeline."""
         log_section("RISK ENGINE - FULL RUN")
 
-        plugins_dir = Path(__file__).parent.parent / "plugins"
+        plugin_dirs = self._discover_plugins()
         self.auto_register_from_config()
 
         loader_registry = LoaderRegistry()
-        loader_registry.auto_discover(plugins_dir)
+        loader_registry.auto_discover(plugin_dirs)
         loader_registry.load_all(self.config, self.registry)
 
         if not self.parameters:

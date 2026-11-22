@@ -10,11 +10,27 @@ from shapely.geometry import Point
 
 sys.path.append(".")
 
-from murasa.plugins.reporting import VectorExplainabilityPlugin, _extract_time_metadata
+from murasa.core.analysis import (
+    compute_gvf,
+    compute_gvf_with_breaks,
+    compute_spearman,
+    compute_weight_sensitivity,
+)
+
+try:
+    from murasa.custom_plugins.reporting import (
+        VectorExplainabilityPlugin,
+        _extract_time_metadata,
+    )
+    _HAS_CUSTOM_REPORTING = True
+except ImportError:
+    VectorExplainabilityPlugin = None
+    _extract_time_metadata = None
+    _HAS_CUSTOM_REPORTING = False
 
 
 def _make_sample_gdf(n: int = 20) -> gpd.GeoDataFrame:
-    """Create a minimal GeoDataFrame matching VectorExplainabilityPlugin post-processing inputs."""
+    """Create a minimal GeoDataFrame matching explainability post-processing inputs."""
     rng = np.random.RandomState(42)
     return gpd.GeoDataFrame(
         {
@@ -58,94 +74,109 @@ class _FakeWeights:
 
 
 class TestGVFMetrics(unittest.TestCase):
-    """Tests for Goodness of Variance Fit (GVF) calculation helpers."""
-
-    def setUp(self):
-        self.plugin = VectorExplainabilityPlugin()
+    """Tests for Goodness of Variance Fit (GVF) helpers in murasa.core.analysis."""
 
     def test_compute_gvf_perfect_groups(self):
         """Perfectly separated groups -> GVF should be very high."""
         vals = np.array([1, 1, 5, 5, 10, 10], dtype=float)
         labels = np.array([0, 0, 1, 1, 2, 2])
-        gvf = self.plugin._compute_gvf(vals, labels)
+        gvf = compute_gvf(vals, labels)
         self.assertGreater(gvf, 0.9, f"Expected GVF > 0.9, got {gvf}")
 
     def test_compute_gvf_zero_variance(self):
         """All values identical -> trivially perfect, GVF = 1.0."""
         vals = np.ones(5)
         labels = np.array([0, 1, 1, 0, 2])
-        gvf = self.plugin._compute_gvf(vals, labels)
+        gvf = compute_gvf(vals, labels)
         self.assertEqual(gvf, 1.0)
 
     def test_compute_gvf_single_class(self):
         """Single class -> SDAM == SDCM -> GVF = 0.0."""
         vals = np.array([1.0, 2.0, 3.0, 4.0])
         labels = np.array([0, 0, 0, 0])
-        gvf = self.plugin._compute_gvf(vals, labels)
+        gvf = compute_gvf(vals, labels)
         self.assertEqual(gvf, 0.0, f"Expected 0.0, got {gvf}")
 
     def test_compute_gvf_with_nan(self):
         """NaN values should be filtered out."""
         vals = np.array([1, np.nan, 5, 5, 10, 10], dtype=float)
         labels = np.array([0, 0, 1, 1, 2, 2])
-        gvf = self.plugin._compute_gvf(vals, labels)
+        gvf = compute_gvf(vals, labels)
         self.assertGreaterEqual(gvf, 0.0)
         self.assertLessEqual(gvf, 1.0)
 
     def test_compute_gvf_with_breaks_perfect(self):
         """Well-separated breaks -> high GVF."""
         vals = np.array([1, 2, 3, 10, 11, 12, 20, 21, 22], dtype=float)
-        breaks = [1, 4, 13, 22]  # 3 classes
-        gvf = self.plugin._compute_gvf_with_breaks(vals, breaks)
+        breaks = [1, 4, 13, 22]
+        gvf = compute_gvf_with_breaks(vals, breaks)
         self.assertGreater(gvf, 0.9, f"Expected GVF > 0.9, got {gvf}")
 
     def test_compute_gvf_with_breaks_zero_variance(self):
         """Constant values -> GVF = 1.0."""
         vals = np.full(10, 5.0)
         breaks = [5.0, 5.0, 5.0]
-        gvf = self.plugin._compute_gvf_with_breaks(vals, breaks)
+        gvf = compute_gvf_with_breaks(vals, breaks)
         self.assertEqual(gvf, 1.0)
 
     def test_compute_gvf_with_breaks_single_break(self):
         """Single class (2 break points) -> GVF = 0.0."""
         vals = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
         breaks = [1.0, 5.0]
-        gvf = self.plugin._compute_gvf_with_breaks(vals, breaks)
+        gvf = compute_gvf_with_breaks(vals, breaks)
         self.assertEqual(gvf, 0.0, f"Expected 0.0, got {gvf}")
 
 
 class TestSpearmanCorrelation(unittest.TestCase):
-    """Tests for Spearman rank correlation helper."""
-
-    def setUp(self):
-        self.plugin = VectorExplainabilityPlugin()
+    """Tests for Spearman rank correlation helper in murasa.core.analysis."""
 
     def test_compute_spearman_perfect(self):
         """Perfectly monotonic -> rho = 1.0."""
-        rho = self.plugin._compute_spearman([1, 2, 3, 4], [10, 20, 30, 40])
+        rho = compute_spearman([1, 2, 3, 4], [10, 20, 30, 40])
         self.assertAlmostEqual(rho, 1.0, places=6)
 
     def test_compute_spearman_inverse(self):
         """Perfectly inverse monotonic -> rho = -1.0."""
-        rho = self.plugin._compute_spearman([1, 2, 3, 4], [40, 30, 20, 10])
+        rho = compute_spearman([1, 2, 3, 4], [40, 30, 20, 10])
         self.assertAlmostEqual(rho, -1.0, places=6)
 
     def test_compute_spearman_insufficient(self):
         """Only 1 data point -> should return 0.0."""
-        rho = self.plugin._compute_spearman([1], [2])
+        rho = compute_spearman([1], [2])
         self.assertEqual(rho, 0.0)
 
     def test_compute_spearman_with_nan(self):
         """NaN should be dropped, still compute on valid pairs."""
         a = [1, 2, float("nan"), 4, 5]
         b = [10, 20, 30, 40, 50]
-        rho = self.plugin._compute_spearman(a, b)
+        rho = compute_spearman(a, b)
         self.assertGreater(rho, 0.5)
         self.assertLessEqual(rho, 1.0)
 
 
+class TestCoreWeightSensitivity(unittest.TestCase):
+    """Domain-neutral tests for compute_weight_sensitivity in murasa.core.analysis."""
+
+    def test_weight_sensitivity_returns_dataframe_and_valid_range(self):
+        rng = np.random.RandomState(42)
+        scores = {f"factor_{i}": rng.uniform(0, 1, 50) for i in range(4)}
+        weights = {f"factor_{i}": 0.25 for i in range(4)}
+        df_sens = compute_weight_sensitivity(scores, weights)
+        self.assertEqual(len(df_sens), 4)
+        self.assertEqual(list(df_sens.columns), ["factor", "stability_index", "impact"])
+        for _, row in df_sens.iterrows():
+            self.assertGreaterEqual(row["stability_index"], -1.0)
+            self.assertLessEqual(row["stability_index"], 1.0)
+
+    def test_weight_sensitivity_empty_returns_empty_dataframe(self):
+        df_sens = compute_weight_sensitivity({}, {})
+        self.assertTrue(df_sens.empty)
+        self.assertEqual(list(df_sens.columns), ["factor", "stability_index", "impact"])
+
+
+@unittest.skipUnless(_HAS_CUSTOM_REPORTING, "custom_plugins.reporting not present")
 class TestSensitivityAnalysis(unittest.TestCase):
-    """Tests for threshold and weight sensitivity analysis helpers."""
+    """Tests for custom reporting threshold and weight sensitivity helpers."""
 
     def setUp(self):
         self.plugin = VectorExplainabilityPlugin()
@@ -178,7 +209,7 @@ class TestSensitivityAnalysis(unittest.TestCase):
         self.assertIn("factor", df_sens.columns)
         self.assertIn("stability_index", df_sens.columns)
         self.assertIn("impact", df_sens.columns)
-        self.assertEqual(len(df_sens), 6)  # 6 factors
+        self.assertEqual(len(df_sens), 6)
 
     def test_weight_sensitivity_stability_range(self):
         """All stability indices should be between -1 and 1."""
@@ -209,8 +240,9 @@ class TestSensitivityAnalysis(unittest.TestCase):
             self.assertEqual(len(df), 6)
 
 
+@unittest.skipUnless(_HAS_CUSTOM_REPORTING, "custom_plugins.reporting not present")
 class TestMetadataAndGoodnessMetrics(unittest.TestCase):
-    """Tests for goodness/stability column injection and time metadata extraction."""
+    """Tests for custom reporting goodness/stability injection and time metadata extraction."""
 
     def setUp(self):
         self.plugin = VectorExplainabilityPlugin()

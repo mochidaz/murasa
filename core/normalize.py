@@ -115,66 +115,14 @@ def invert(data: np.ndarray) -> np.ndarray:
 
 def classify_quantile(data: np.ndarray,
                       n_classes: int = 5) -> Tuple[np.ndarray, list]:
-    """
-    Classify into n_classes using quantile breaks.
-
-    Returns:
-        (classified array (1-based integers), break values)
-    """
-    valid = np.isfinite(data)
-    classified = np.zeros_like(data, dtype=np.uint8)
-
-    if not valid.any():
-        return classified, []
-
-    quantiles = np.linspace(0, 100, n_classes + 1)
-    breaks = np.percentile(data[valid], quantiles).tolist()
-
-    for i in range(n_classes):
-        if i < n_classes - 1:
-            mask = (data >= breaks[i]) & (data < breaks[i + 1])
-        else:
-            mask = data >= breaks[i]
-        classified[mask] = i + 1
-
-    return classified, breaks
+    """Re-exported for backwards compatibility; canonical definition lives in murasa.core.classification."""
+    from .classification import classify_quantile as _classify_quantile
+    return _classify_quantile(data, n_classes=n_classes)
 
 
 def classify_jenks(data: np.ndarray,
                    n_classes: int = 5,
                    sample_size: int = 100000) -> Tuple[np.ndarray, list]:
-    """
-    Classify using Jenks Natural Breaks (if jenkspy available).
-    Falls back to quantile if not available.
-
-    Returns:
-        (classified array (1-based integers), break values)
-    """
-    try:
-        import jenkspy
-    except ImportError:
-        return classify_quantile(data, n_classes)
-
-    valid = np.isfinite(data)
-    classified = np.zeros_like(data, dtype=np.uint8)
-
-    if not valid.any():
-        return classified, []
-
-    values = data[valid]
-    if len(values) > sample_size:
-        rng = np.random.default_rng(42)
-        sample = rng.choice(values, sample_size, replace=False)
-    else:
-        sample = values
-
-    breaks = jenkspy.jenks_breaks(sample, n_classes=n_classes)
-
-    for i in range(len(breaks) - 1):
-        if i < len(breaks) - 2:
-            mask = (data >= breaks[i]) & (data < breaks[i + 1])
-        else:
-            mask = data >= breaks[i]
-        classified[mask] = i + 1
-
-    return classified, breaks
+    """Re-exported for backwards compatibility; canonical definition lives in murasa.core.classification."""
+    from .classification import classify_jenks as _classify_jenks
+    return _classify_jenks(data, n_classes=n_classes, sample_size=sample_size)

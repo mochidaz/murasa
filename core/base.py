@@ -1,11 +1,80 @@
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Tuple, Any, Optional, Dict, List, Type
+from typing import Tuple, Any, Optional, Dict, List, Type, Iterable, Union
+import hashlib
 import inspect
 import numpy as np
 
 from .data_source import DataRegistry
 from .logger import logger
+
+
+_PACKAGE_ROOT = Path(__file__).resolve().parent.parent
+INTERNAL_PLUGINS_DIR = _PACKAGE_ROOT / "plugins"
+CUSTOM_PLUGINS_DIR = _PACKAGE_ROOT / "custom_plugins"
+
+
+def resolve_plugin_dirs(
+    plugins_dir: Optional[Union[Path, str, Iterable[Union[Path, str]]]] = None,
+    extra_dirs: Optional[Iterable[Union[Path, str]]] = None,
+    include_custom: Optional[bool] = None,
+) -> List[Path]:
+    """
+    Resolve ordered, deduplicated plugin root directories.
+
+    When plugins_dir is omitted or resolves to Murasa's internal plugins/
+    directory, the sibling custom_plugins/ directory is included automatically
+    unless include_custom=False.
+    """
+    candidates: List[Path] = []
+    if plugins_dir is None:
+        candidates.append(INTERNAL_PLUGINS_DIR)
+        if include_custom is not False:
+            candidates.append(CUSTOM_PLUGINS_DIR)
+    else:
+        raw_items = (
+            [plugins_dir]
+            if isinstance(plugins_dir, (str, Path))
+            else list(plugins_dir)
+        )
+        for item in raw_items:
+            if not item:
+                continue
+            resolved = Path(item).resolve()
+            candidates.append(resolved)
+            if (include_custom is True) or (
+                include_custom is None and resolved == INTERNAL_PLUGINS_DIR.resolve()
+            ):
+                candidates.append(CUSTOM_PLUGINS_DIR)
+
+    if extra_dirs:
+        for item in extra_dirs:
+            if item:
+                candidates.append(Path(item).resolve())
+
+    unique: List[Path] = []
+    seen: set[Path] = set()
+    for p in candidates:
+        rp = p.resolve()
+        if rp not in seen:
+            seen.add(rp)
+            unique.append(rp)
+    return unique
+
+
+def _plugin_module_name(base_dir: Path, py_file: Path, subpkg: Optional[str] = None) -> str:
+    """Build an isolated module name for dynamically discovered plugin or loader files."""
+    resolved = base_dir.resolve()
+    if resolved == INTERNAL_PLUGINS_DIR.resolve():
+        prefix = "murasa.plugins"
+    elif resolved == CUSTOM_PLUGINS_DIR.resolve():
+        prefix = "murasa.custom_plugins"
+    else:
+        digest = hashlib.md5(str(resolved).encode("utf-8")).hexdigest()[:8]
+        prefix = f"murasa.ext_plugins_{digest}"
+    if subpkg:
+        return f"{prefix}.{subpkg}.{py_file.stem}"
+    return f"{prefix}.{py_file.stem}"
 
 
 class ParameterPlugin(ABC):
@@ -149,12 +218,31 @@ class RasterParameterPlugin(ParameterPlugin):
         for key, val in kwargs.items():
             setattr(self, key, val)
 
+    def _resolve_source_keys(self, registry: Optional[DataRegistry] = None) -> List[str]:
+        candidates: List[str] = []
+        explicit_source = getattr(self, "source", None)
+        if explicit_source:
+            candidates.append(explicit_source)
+        elif self.name and (
+            not self.source_keys
+            or (registry is not None and registry.has(self.name))
+        ):
+            candidates.append(self.name)
+
+        for key in (self.source_keys or []):
+            if key not in candidates:
+                candidates.append(key)
+
+        if not candidates and self.name:
+            candidates.append(self.name)
+        return candidates
+
     def validate_requirements(self, registry: DataRegistry) -> bool:
-        keys = self.source_keys or [self.name]
+        keys = self._resolve_source_keys(registry)
         return any(registry.has(k) for k in keys)
 
     def _find_source(self, registry: DataRegistry):
-        keys = self.source_keys or [self.name]
+        keys = self._resolve_source_keys(registry)
         for key in keys:
             if registry.has(key):
                 return registry.get(key)
@@ -356,29 +444,38 @@ class PluginRegistry:
             instance.metadata.update(extra_metadata)
         return instance
 
-    def auto_discover(self, plugins_dir: Optional[Path] = None):
-        """Auto-discover and import all plugin modules in the specified directory."""
+    def auto_discover(
+        self,
+        plugins_dir: Optional[Union[Path, str, Iterable[Union[Path, str]]]] = None,
+        extra_dirs: Optional[Iterable[Union[Path, str]]] = None,
+        include_custom: Optional[bool] = None,
+    ):
+        """Auto-discover and import all plugin modules across the resolved plugin directories."""
         import importlib.util
 
-        if plugins_dir is None:
-            plugins_dir = Path(__file__).parent.parent / "plugins"
-        plugins_dir = Path(plugins_dir).resolve()
+        dirs = resolve_plugin_dirs(
+            plugins_dir,
+            extra_dirs=extra_dirs,
+            include_custom=include_custom,
+        )
 
-        if plugins_dir in self._discovered_dirs or not plugins_dir.exists():
-            return
-
-        logger.debug(f"Auto-discovering plugins in: {plugins_dir}")
-        for py_file in sorted(plugins_dir.glob("*.py")):
-            if py_file.name.startswith("_"):
+        for pdir in dirs:
+            if pdir in self._discovered_dirs or not pdir.exists():
                 continue
-            try:
-                spec = importlib.util.spec_from_file_location(f"murasa.plugins.{py_file.stem}", py_file)
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
-            except Exception as e:
-                logger.debug(f"Auto-discovery notice for {py_file.name}: {e}")
 
-        self._discovered_dirs.add(plugins_dir)
+            logger.debug(f"Auto-discovering plugins in: {pdir}")
+            for py_file in sorted(pdir.glob("*.py")):
+                if py_file.name.startswith("_"):
+                    continue
+                try:
+                    mod_name = _plugin_module_name(pdir, py_file)
+                    spec = importlib.util.spec_from_file_location(mod_name, py_file)
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                except Exception as e:
+                    logger.debug(f"Auto-discovery notice for {py_file.name}: {e}")
+
+            self._discovered_dirs.add(pdir)
 
     def list_plugins(self, base_type: Optional[Type] = None) -> List[str]:
         """List registered plugin names, optionally filtered by base class."""
@@ -405,42 +502,58 @@ class LoaderRegistry:
 
     def __init__(self):
         self.loaders: List[Type[DataLoaderPlugin]] = []
-        self._discovered = False
+        self._discovered_dirs: set[Path] = set()
+        self._auto_discovered_called: bool = False
 
-    def auto_discover(self, plugins_dir: Optional[Path] = None):
-        """Discover all DataLoaderPlugin subclasses in the plugins/loaders directory."""
+    @property
+    def _discovered(self) -> bool:
+        return self._auto_discovered_called or bool(self._discovered_dirs)
+
+    def auto_discover(
+        self,
+        plugins_dir: Optional[Union[Path, str, Iterable[Union[Path, str]]]] = None,
+        extra_dirs: Optional[Iterable[Union[Path, str]]] = None,
+        include_custom: Optional[bool] = None,
+    ):
+        """Discover all DataLoaderPlugin subclasses across resolved plugin loaders directories."""
         import importlib.util
 
-        if plugins_dir is None:
-            plugins_dir = Path(__file__).parent.parent / "plugins"
-        loaders_dir = Path(plugins_dir) / "loaders"
+        self._auto_discovered_called = True
+        dirs = resolve_plugin_dirs(
+            plugins_dir,
+            extra_dirs=extra_dirs,
+            include_custom=include_custom,
+        )
 
-        if not loaders_dir.exists():
-            logger.warning(f"Loaders directory not found: {loaders_dir}")
-            return
-
-        for module_file in sorted(loaders_dir.glob("*.py")):
-            if module_file.name.startswith("_"):
+        for pdir in dirs:
+            loaders_dir = pdir if pdir.name == "loaders" else (pdir / "loaders").resolve()
+            if loaders_dir in self._discovered_dirs:
+                continue
+            if not loaders_dir.exists():
+                logger.debug(f"Loaders directory not found: {loaders_dir}")
                 continue
 
-            try:
-                spec = importlib.util.spec_from_file_location(
-                    f"murasa.plugins.loaders.{module_file.stem}", module_file
-                )
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
+            for module_file in sorted(loaders_dir.glob("*.py")):
+                if module_file.name.startswith("_"):
+                    continue
 
-                for _, obj in inspect.getmembers(module, inspect.isclass):
-                    if (
-                        issubclass(obj, DataLoaderPlugin)
-                        and obj is not DataLoaderPlugin
-                        and obj not in self.loaders
-                    ):
-                        self.loaders.append(obj)
-            except Exception as e:
-                logger.error(f"Failed to load loader module {module_file.name}: {e}")
+                try:
+                    mod_name = _plugin_module_name(pdir, module_file, subpkg="loaders")
+                    spec = importlib.util.spec_from_file_location(mod_name, module_file)
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
 
-        self._discovered = True
+                    for _, obj in inspect.getmembers(module, inspect.isclass):
+                        if (
+                            issubclass(obj, DataLoaderPlugin)
+                            and obj is not DataLoaderPlugin
+                            and obj not in self.loaders
+                        ):
+                            self.loaders.append(obj)
+                except Exception as e:
+                    logger.error(f"Failed to load loader module {module_file.name}: {e}")
+
+            self._discovered_dirs.add(loaders_dir)
 
     def register(self, loader_class: Type[DataLoaderPlugin]):
         if loader_class not in self.loaders:

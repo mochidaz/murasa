@@ -1,4 +1,5 @@
 import heapq
+from typing import Optional
 import numpy as np
 from scipy.ndimage import binary_erosion
 
@@ -94,23 +95,17 @@ def fill_sinks(dem: np.ndarray, epsilon: float = 1e-5) -> np.ndarray:
     return np.array(out, dtype=np.float64).reshape(rows, cols)
 
 
-def flow_direction(dem: np.ndarray) -> np.ndarray:
-    """
-    Compute D8 steepest-descent receiver index for each cell in a 2D DEM.
-
-    Args:
-        dem: 2D elevation array.
-
-    Returns:
-        1D int64 array of flattened downstream receiver indices (-1 for sinks/outlets/NaNs).
-    """
-    arr = np.asarray(dem, dtype=np.float64)
+def _flow_direction_indices(dem: np.ndarray, index_dtype=np.int64) -> np.ndarray:
+    """Compute 1D D8 steepest-descent receiver indices using specified integer/float precision."""
+    arr = np.asarray(dem)
+    if arr.dtype not in (np.float32, np.float64):
+        arr = arr.astype(np.float64)
     rows, cols = arr.shape
     n = rows * cols
     valid = np.isfinite(arr)
 
-    best_slope = np.zeros((rows, cols), dtype=np.float64)
-    receiver = np.full((rows, cols), -1, dtype=np.int64)
+    best_slope = np.zeros((rows, cols), dtype=arr.dtype)
+    receiver = np.full((rows, cols), -1, dtype=index_dtype)
 
     for dr, dc, dist in _D8_OFFSETS:
         r_src = slice(max(0, -dr), rows - max(0, dr))
@@ -122,7 +117,7 @@ def flow_direction(dem: np.ndarray) -> np.ndarray:
         dst_z = arr[r_dst, c_dst]
         pair_valid = valid[r_src, c_src] & valid[r_dst, c_dst]
 
-        drop = np.where(pair_valid, (src_z - dst_z) / dist, 0.0)
+        drop = np.where(pair_valid, (src_z - dst_z) / arr.dtype.type(dist), arr.dtype.type(0.0))
         better = pair_valid & (drop > best_slope[r_src, c_src])
 
         if better.any():
@@ -130,10 +125,26 @@ def flow_direction(dem: np.ndarray) -> np.ndarray:
             dst_r, dst_c = np.nonzero(better)
             src_r_idx = dst_r + max(0, -dr)
             src_c_idx = dst_c + max(0, -dc)
-            dst_flat = (dst_r + max(0, dr)) * cols + (dst_c + max(0, dc))
+            dst_flat = (
+                (dst_r.astype(index_dtype) + max(0, dr)) * index_dtype(cols)
+                + (dst_c.astype(index_dtype) + max(0, dc))
+            )
             receiver[src_r_idx, src_c_idx] = dst_flat
 
     return receiver.reshape(n)
+
+
+def flow_direction(dem: np.ndarray) -> np.ndarray:
+    """
+    Compute D8 steepest-descent receiver index for each cell in a 2D DEM.
+
+    Args:
+        dem: 2D elevation array.
+
+    Returns:
+        1D int64 array of flattened downstream receiver indices (-1 for sinks/outlets/NaNs).
+    """
+    return _flow_direction_indices(np.asarray(dem, dtype=np.float64), index_dtype=np.int64)
 
 
 def flow_accumulation(
@@ -222,3 +233,115 @@ def calculate_twi(
     valid = np.isfinite(arr) & np.isfinite(specific_area) & np.isfinite(tan_slope)
     twi[valid] = np.log(specific_area[valid] / tan_slope[valid]).astype(np.float32)
     return twi
+
+
+def calculate_hand(
+    dem: np.ndarray,
+    stream_mask: Optional[np.ndarray] = None,
+    stream_threshold: float = 500.0,
+    fill: bool = True,
+    epsilon: float = 1e-5,
+) -> np.ndarray:
+    """
+    Compute Height Above Nearest Drainage (HAND) along D8 flow paths.
+
+    Each valid cell measures its vertical drop to the drainage network cell it
+    ultimately drains into (zero on drainage cells; non-negative elsewhere; NaN
+    outside the valid DEM). If a cell's path exits the grid without crossing
+    a stream cell, it falls back to its catchment exit elevation.
+
+    Args:
+        dem: 2D elevation array.
+        stream_mask: Optional boolean mask of drainage cells matching dem.shape.
+            When omitted, streams are derived from flow_accumulation >= stream_threshold.
+        stream_threshold: Minimum contributing cell count defining streams when
+            stream_mask is None.
+        fill: Whether to run fill_sinks before routing.
+        epsilon: Elevation increment passed to fill_sinks when fill=True.
+
+    Returns:
+        2D float32 HAND raster in vertical DEM units (usually meters).
+    """
+    arr = np.asarray(dem)
+    if arr.ndim != 2:
+        raise ValueError(f"Expected 2D DEM array, got shape {arr.shape}")
+
+    rows, cols = arr.shape
+    if rows == 0 or cols == 0:
+        return arr.astype(np.float32)
+
+    valid = np.isfinite(arr)
+    if not valid.any():
+        return np.full(arr.shape, np.nan, dtype=np.float32)
+
+    if stream_mask is not None:
+        stream_arr = np.asarray(stream_mask, dtype=bool)
+        if stream_arr.shape != arr.shape:
+            raise ValueError(
+                f"stream_mask shape {stream_arr.shape} must match DEM shape {arr.shape}"
+            )
+    else:
+        stream_arr = None
+
+    conditioned = fill_sinks(arr, epsilon=epsilon) if fill else (
+        arr if arr.dtype in (np.float32, np.float64) else arr.astype(np.float64)
+    )
+    n = rows * cols
+    idx_dtype = np.int32 if n < 2_147_483_647 else np.int64
+
+    receiver = _flow_direction_indices(conditioned, index_dtype=idx_dtype)
+    valid_flat = valid.ravel()
+    in_degree = np.bincount(receiver[receiver >= 0], minlength=n).astype(idx_dtype)
+
+    need_acc = stream_arr is None
+    acc = np.where(valid_flat, 1.0, 0.0).astype(np.float32) if need_acc else None
+
+    waves = []
+    active = np.flatnonzero(valid_flat & (in_degree == 0)).astype(idx_dtype)
+    while active.size > 0:
+        rcv = receiver[active]
+        mask = rcv >= 0
+        if not mask.any():
+            break
+
+        src_cells = active[mask]
+        dst_cells = rcv[mask]
+        waves.append((src_cells, dst_cells))
+
+        if need_acc:
+            np.add.at(acc, dst_cells, acc[src_cells])
+        np.subtract.at(in_degree, dst_cells, 1)
+
+        candidates = np.unique(dst_cells)
+        active = candidates[in_degree[candidates] == 0]
+
+    del in_degree
+
+    if stream_arr is not None:
+        stream_flat = valid_flat & stream_arr.ravel()
+    else:
+        stream_flat = valid_flat & (acc >= float(stream_threshold))
+        if not stream_flat.any():
+            max_acc = float(np.max(acc[valid_flat])) if valid_flat.any() else 1.0
+            stream_flat = valid_flat & (acc >= max(1.0, max_acc))
+        del acc
+
+    elev_flat = conditioned.ravel().astype(np.float32, copy=False)
+    drain_elev = np.full(n, np.nan, dtype=np.float32)
+
+    outlets = valid_flat & (receiver < 0)
+    drain_elev[outlets] = elev_flat[outlets]
+    drain_elev[stream_flat] = elev_flat[stream_flat]
+    del receiver
+
+    for src_cells, dst_cells in reversed(waves):
+        propagate = ~stream_flat[src_cells]
+        if propagate.any():
+            p_src = src_cells[propagate]
+            p_dst = dst_cells[propagate]
+            drain_elev[p_src] = drain_elev[p_dst]
+
+    hand_flat = np.full(n, np.nan, dtype=np.float32)
+    resolved = valid_flat & np.isfinite(drain_elev)
+    hand_flat[resolved] = np.maximum(elev_flat[resolved] - drain_elev[resolved], 0.0).astype(np.float32)
+    return hand_flat.reshape(rows, cols)

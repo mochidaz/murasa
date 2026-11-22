@@ -8,7 +8,7 @@ from rasterio.transform import from_origin
 
 from murasa.core.data_source import DataRegistry, DataSource, SourceType
 from murasa.core.resampler import RasterResampler
-from murasa.plugins.rainfall import RainfallPlugin
+from murasa.plugins.raster import GenericRasterPlugin
 
 
 class TestRasterNodataHandling(unittest.TestCase):
@@ -81,26 +81,31 @@ class TestRasterNodataHandling(unittest.TestCase):
             )
             np.testing.assert_allclose(source.data[2:, :], 50.0)
 
-    def test_rainfall_plugin_treats_unset_nodata_sentinel_as_nan_not_zero_mm(self):
+    def test_raster_plugin_treats_unset_nodata_sentinel_as_nan_and_preserves_range(self):
         shape = (4, 4)
         tf = from_origin(500000.0, 9200040.0, 10.0, 10.0)
-        rain_arr = np.full(shape, 400.0, dtype=np.float32)
-        rain_arr[:2, :] = -9999.0
+        arr = np.full(shape, 10.0, dtype=np.float32)
+        arr[3, :] = 20.0
+        arr[:2, :] = -9999.0
 
         with tempfile.TemporaryDirectory() as tmp:
-            tif_path = Path(tmp) / "rain_unset_nodata.tif"
-            self._write_geotiff(tif_path, rain_arr, tf, nodata=None)
+            tif_path = Path(tmp) / "hazard_unset_nodata.tif"
+            self._write_geotiff(tif_path, arr, tf, nodata=None)
 
             registry = DataRegistry()
-            registry.register_from_path("rainfall", tif_path, SourceType.RASTER, crs="EPSG:32748")
+            registry.register_from_path("hazard_layer", tif_path, SourceType.RASTER, crs="EPSG:32748")
 
-            score = RainfallPlugin(normalize_method="bmkg_threshold").process(registry, shape, tf, "EPSG:32748")
+            score = GenericRasterPlugin(
+                name="hazard_layer",
+                normalization="minmax",
+            ).process(registry, shape, tf, "EPSG:32748")
 
             self.assertTrue(
                 np.all(np.isnan(score[:2, :])),
-                f"Expected nodata rainfall area to remain NaN, got scores {np.unique(score[:2, :])}",
+                f"Expected nodata area to remain NaN, got scores {np.unique(score[:2, :])}",
             )
-            np.testing.assert_allclose(score[2:, :], 0.8, atol=1e-6)
+            np.testing.assert_allclose(score[2, :], 0.0, atol=1e-6)
+            np.testing.assert_allclose(score[3, :], 1.0, atol=1e-6)
 
     def test_zero_uint8_int16_inmemory_nodata_and_fill_nodata(self):
         tf = from_origin(500000.0, 9200040.0, 10.0, 10.0)

@@ -6,11 +6,8 @@ output
 output_*
 murasa.egg-info
 presets
-examples/run_batch_monthly.py
-examples/upload_to_postgis.py
-examples/verify_bnpb_formula.py
-examples/run_landslide_focal_hotspots.py
-examples/run_landslide_hotspots.py
-examples/run_landslide_tribakti_hotspots.py
-plugins/hotspot.py
+examples/*
+!examples/example.py
+custom_plugins/
 tmp_test_output
+tests/test_plugin_discovery.py

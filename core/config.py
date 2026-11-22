@@ -269,6 +269,13 @@ class EngineConfig:
     weights: WeightsConfig = field(default_factory=WeightsConfig)
     plugin_parameters: Dict[str, Any] = field(default_factory=dict)
     post_processors: List[Any] = field(default_factory=list)
+    plugin_dirs: List[Path] = field(default_factory=list)
+
+    def __post_init__(self):
+        if isinstance(self.plugin_dirs, (str, Path)):
+            self.plugin_dirs = [Path(self.plugin_dirs)]
+        else:
+            self.plugin_dirs = [Path(p) for p in self.plugin_dirs if p]
 
     def get_weights(self) -> Dict[str, float]:
         if self.weights:
@@ -345,6 +352,15 @@ class EngineConfig:
         config.plugin_parameters = config.parameters
         config.post_processors = data.get('post_processors', [])
 
+        raw_plugin_dirs = data.get('plugin_dirs', [])
+        if isinstance(raw_plugin_dirs, (str, Path)):
+            raw_plugin_dirs = [raw_plugin_dirs]
+        for pdir in raw_plugin_dirs or []:
+            if not pdir:
+                continue
+            p = Path(pdir)
+            config.plugin_dirs.append(p if p.is_absolute() else (base_dir / p).resolve())
+
         if 'paths' in data or 'weights' in data:
             config._load_paths_weights_format(data, base_dir)
         else:
@@ -369,11 +385,13 @@ class EngineConfig:
                 continue
 
             factor_params = self.parameters.get(factor_name, {})
-            source_key = factor_params.get('source', factor_name) if isinstance(factor_params, dict) else factor_name
+            is_param_dict = isinstance(factor_params, dict)
+            source_key = factor_params.get('source', factor_name) if is_param_dict else factor_name
             source_path = self.paths.get(source_key)
 
             stype = infer_source_type(source_path if isinstance(source_path, Path) else None)
-            group = factor_params.get('group', 'hazard') if isinstance(factor_params, dict) else 'hazard'
+            group = factor_params.get('group', 'hazard') if is_param_dict else 'hazard'
+            processor = (factor_params.get('processor') or factor_params.get('plugin')) if is_param_dict else None
 
             self.factors[factor_name] = FactorConfig(
                 name=factor_name,
@@ -381,7 +399,8 @@ class EngineConfig:
                 source_path=source_path if isinstance(source_path, Path) else None,
                 source_type=stype,
                 group=group,
-                parameters=factor_params if isinstance(factor_params, dict) else {}
+                processor=processor,
+                parameters=factor_params if is_param_dict else {}
             )
 
     def _load_factors_format(self, data: dict, base_dir: Path) -> None:
@@ -398,6 +417,12 @@ class EngineConfig:
 
             weight = float(fdata.get('weight', 0.0))
             weights_dict[name] = weight
+            params = fdata.get('parameters', {}) or {}
+            processor = (
+                fdata.get('processor')
+                or fdata.get('plugin')
+                or (params.get('processor') or params.get('plugin') if isinstance(params, dict) else None)
+            )
 
             self.factors[name] = FactorConfig(
                 name=name,
@@ -405,8 +430,8 @@ class EngineConfig:
                 source_path=source_path,
                 source_type=fdata.get('type', infer_source_type(source_path, 'raster')),
                 group=fdata.get('group', 'hazard'),
-                processor=fdata.get('processor'),
-                parameters=fdata.get('parameters', {})
+                processor=processor,
+                parameters=params if isinstance(params, dict) else {}
             )
 
         self.paths = PathsConfig(base_dir=base_dir, **paths_dict)
@@ -444,6 +469,8 @@ class EngineConfig:
                 'thresholds': self.classification.thresholds,
             },
         }
+        if self.plugin_dirs:
+            data['plugin_dirs'] = [str(p) for p in self.plugin_dirs]
 
         yaml_path = Path(yaml_path)
         yaml_path.parent.mkdir(parents=True, exist_ok=True)

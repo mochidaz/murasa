@@ -1,3 +1,4 @@
+from typing import Optional
 from murasa.core.base import ParameterPlugin, register_plugin
 from murasa.core.processing import ProcessingContext
 from murasa.core.logger import logger
@@ -18,25 +19,35 @@ class ProximityPlugin(ParameterPlugin):
         name: str = "proximity",
         weight: float = 0.10,
         group: str = "hazard",
-        feature_name: str = "river",
-        feature: str = None,
+        feature_name: Optional[str] = None,
+        feature: Optional[str] = None,
+        source: Optional[str] = None,
         max_distance: float = 500,
         **kwargs
     ):
         super().__init__(name, weight, group, **kwargs)
-        self.feature_name = feature or feature_name
+        self._explicit_feature = feature or feature_name or source
+        self.feature_name = self._explicit_feature or "river"
         self.max_distance = max_distance
 
+    def _resolve_feature_key(self, registry) -> str:
+        if self._explicit_feature:
+            return self._explicit_feature
+        if self.name and registry.has(self.name):
+            return self.name
+        return self.feature_name
+
     def validate_requirements(self, registry):
-        return registry.has(self.feature_name)
+        return registry.has(self._resolve_feature_key(registry))
 
     def process(self, registry, grid_shape, transform, crs):
         self.log_processing()
         ctx = ProcessingContext(grid_shape, transform, crs)
 
-        feature_source = registry.get(self.feature_name)
+        feature_key = self._resolve_feature_key(registry)
+        feature_source = registry.get(feature_key)
         if feature_source.data.empty:
-            logger.warning(f"      No {self.feature_name} features found")
+            logger.warning(f"      No {feature_key} features found")
             return ctx.empty_grid()
 
         dist_score = ctx.distance_to_features(
